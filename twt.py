@@ -24,6 +24,7 @@ SEARCH_URL   = (
     "f=live"
 )
 CONFIG_PATH  = "bot_config.json"
+TOKEN_PATH   = "tokens.json"
 REPLIED_LOG  = "replied_ids.json"
 SESSION_DIR  = "bot_session"
 COOKIE_FILE  = "session.json"
@@ -46,6 +47,10 @@ def load_config():
         console.print(f"[bold red]ERROR:[/] Gagal baca/parse `{CONFIG_PATH}`.")
         sys.exit(1)
     return cfg
+
+def load_tokens():
+    data = load_json(TOKEN_PATH)
+    return data if isinstance(data, dict) else {}
 
 def load_replied():
     data = load_json(REPLIED_LOG)
@@ -226,7 +231,8 @@ async def run():
     log_preds    = cfg.get("log_predictions", True)
     dry_run      = cfg.get("dry_run", False)
 
-    hf_token = os.getenv("HF_API_TOKEN")
+    tokens   = load_tokens()
+    hf_token = tokens.get("hf_api_token")
     ai_client = None
     if ai_enabled and hf_token:
         ai_client = ZeroShotClient(ai_model, hf_token, timeout_ms=ai_timeout)
