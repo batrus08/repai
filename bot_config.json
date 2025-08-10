@@ -1,4 +1,10 @@
 {
+  "search_config": {
+    "keyword": "chatgpt",
+    "hashtag": "zonauang",
+    "src": "recent_search_click",
+    "live": true
+  },
   "positive_keywords": [
     "chatgpt",
     "Chatgpt",
