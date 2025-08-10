@@ -17,12 +17,7 @@ from rich.text import Text
 from ai import ZeroShotClient
 
 # ---- KONFIGURASI ----
-SEARCH_URL   = (
-    "https://x.com/search?"
-    "q=chatgpt%20%23zonauang&"
-    "src=recent_search_click&"
-    "f=live"
-)
+# URL pencarian kini diatur lewat `search_config` pada bot_config.json
 CONFIG_PATH  = "bot_config.json"
 TOKEN_PATH   = "tokens.json"
 REPLIED_LOG  = "replied_ids.json"
@@ -47,6 +42,29 @@ def load_config():
         console.print(f"[bold red]ERROR:[/] Gagal baca/parse `{CONFIG_PATH}`.")
         sys.exit(1)
     return cfg
+
+
+def build_search_url(cfg: dict) -> str:
+    """Bangun URL pencarian X dari konfigurasi.
+    Mudah ubah keyword/hashtag via bot_config.json."""
+    default = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
+    sc = cfg.get("search_config")
+    if not isinstance(sc, dict):
+        return default
+
+    keyword = sc.get("keyword")
+    hashtag = sc.get("hashtag")
+    src = sc.get("src", "recent_search_click")
+    live = sc.get("live", True)
+
+    if not keyword or not hashtag:
+        return default
+
+    query = f"{keyword} #{hashtag}".replace(" ", "%20").replace("#", "%23")
+    url = f"https://x.com/search?q={query}&src={src}"
+    if live:
+        url += "&f=live"
+    return url
 
 def load_tokens():
     data = load_json(TOKEN_PATH)
@@ -217,10 +235,11 @@ def build_layout(stats, timer, offset) -> Layout:
     return layout
 
 async def run():
-    cfg     = load_config()
-    pos_kws = cfg.get("positive_keywords", [])
-    neg_kws = cfg.get("negative_keywords", [])
-    reply   = cfg.get("reply_message", "")
+    cfg        = load_config()
+    search_url = build_search_url(cfg)  # mudah ganti kata kunci/hashtag
+    pos_kws    = cfg.get("positive_keywords", [])
+    neg_kws    = cfg.get("negative_keywords", [])
+    reply      = cfg.get("reply_message", "")
 
     ai_enabled   = cfg.get("ai_enabled", False)
     ai_model     = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
@@ -260,7 +279,7 @@ async def run():
         offset = 0
         while True:
             try:
-                await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+                await page.goto(search_url, wait_until="domcontentloaded")
                 await detect_captcha(page)
                 await asyncio.sleep(1)
 
