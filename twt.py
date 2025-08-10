@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, json, asyncio
+import sys, os, json, asyncio, unicodedata
 from datetime import datetime, timedelta, timezone
 
 from playwright.async_api import async_playwright, TimeoutError
@@ -13,6 +13,8 @@ from rich.panel import Panel
 from rich.align import Align
 from rich.table import Table
 from rich.text import Text
+
+from ai import ZeroShotClient
 
 # ---- KONFIGURASI ----
 SEARCH_URL   = (
@@ -86,7 +88,11 @@ def render_summary(stats) -> Table:
         ("🎯 Kandidat",   stats["cand"]),
         ("✅ Terbalas",   stats["replied"]),
         ("⏰ Lewat Usia", stats["age"]),
-        ("🔑 Skip KW",    stats["kw"]),
+        ("🪤 Prefilter",  stats["kw"]),
+        ("🤖 AI Call",    stats["ai_calls"]),
+        ("🚫 AI Skip",    stats["ai_skip"]),
+        ("⁉️ Ambigu",     stats["ai_amb"]),
+        ("💥 AI Err",     stats["ai_err"]),
         ("🚫 Skip Btn",   stats["btn"]),
         ("✋ Skip Dis",    stats["dis"]),
     ]
@@ -115,6 +121,43 @@ def render_marquee(offset: int) -> Text:
     big = s * ((width // len(s)) + 2)
     pos = offset % len(s)
     return Text(big[pos:pos+width], style="dim")
+
+
+def normalize_text(text: str) -> str:
+    """Normalisasi unicode dan huruf kecil."""
+    return unicodedata.normalize("NFKC", text).lower().strip()
+
+
+def passes_prefilter(text: str, pos_keywords, neg_keywords) -> bool:
+    """Saring cepat berdasarkan keyword positif/negatif."""
+    if not text:
+        return False
+    t = normalize_text(text)
+    if len(t) < 5:
+        return False
+    if not any(k.lower() in t for k in pos_keywords):
+        return False
+    if any(n.lower() in t for n in neg_keywords):
+        return False
+    return True
+
+
+def log_ai_decision(tid, label, conf, prefilter_pass, reason, text, path="ai_decisions.log"):
+    data = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "tweet_id": tid,
+        "label": label,
+        "confidence": conf,
+        "prefilter_pass": prefilter_pass,
+        "reason": reason,
+        "text_sample": text[:200],
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        pass
 
 def build_layout(stats, timer, offset) -> Layout:
     layout = Layout()
@@ -173,9 +216,24 @@ async def run():
     pos_kws = cfg.get("positive_keywords", [])
     neg_kws = cfg.get("negative_keywords", [])
     reply   = cfg.get("reply_message", "")
+
+    ai_enabled   = cfg.get("ai_enabled", False)
+    ai_model     = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
+    ai_labels    = cfg.get("ai_candidate_labels", ["pembeli", "penjual", "lainnya"])
+    ai_threshold = cfg.get("ai_threshold", 0.8)
+    ai_timeout   = cfg.get("ai_timeout_ms", 4000)
+    pre_filter   = cfg.get("pre_filter_keywords", True)
+    log_preds    = cfg.get("log_predictions", True)
+    dry_run      = cfg.get("dry_run", False)
+
+    hf_token = os.getenv("HF_API_TOKEN")
+    ai_client = None
+    if ai_enabled and hf_token:
+        ai_client = ZeroShotClient(ai_model, hf_token, timeout_ms=ai_timeout)
+
     replied = load_replied()
     last_id = 0
-    stats   = {k:0 for k in ("scanned","cand","replied","age","kw","btn","dis")}
+    stats   = {k:0 for k in ("scanned","cand","replied","age","kw","btn","dis","ai_calls","ai_skip","ai_amb","ai_err")}
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch_persistent_context(
@@ -223,16 +281,60 @@ async def run():
                     if datetime.now(timezone.utc) - ttime > timedelta(hours=MAX_AGE_HRS):
                         stats["age"] += 1
                         continue
-                    text = (await art.inner_text()).lower()
-                    if not any(k in text for k in pos_kws) or any(n in text for n in neg_kws):
+
+                    raw_text = await art.inner_text()
+                    norm_text = normalize_text(raw_text)
+                    if len(norm_text) < 5:
                         stats["kw"] += 1
+                        if log_preds:
+                            log_ai_decision(tid, None, 0.0, False, "too_short", norm_text)
                         continue
+                    if pre_filter and not passes_prefilter(norm_text, pos_kws, neg_kws):
+                        stats["kw"] += 1
+                        if log_preds:
+                            log_ai_decision(tid, None, 0.0, False, "prefilter_fail", norm_text)
+                        continue
+
                     btn = await art.query_selector("[data-testid='reply']")
                     if not btn:
                         stats["btn"] += 1
                         continue
                     if await btn.get_attribute("aria-disabled") == "true":
                         stats["dis"] += 1
+                        continue
+
+                    label = None
+                    conf = 0.0
+                    reason = ""
+
+                    if ai_enabled:
+                        if not ai_client:
+                            stats["ai_skip"] += 1
+                            reason = "ai_disabled"
+                        else:
+                            stats["ai_calls"] += 1
+                            res = await ai_client.classify(norm_text, ai_labels)
+                            if not res:
+                                stats["ai_err"] += 1
+                                reason = "error_ai"
+                            else:
+                                label, conf = res
+                                if label == "pembeli" and conf >= ai_threshold:
+                                    reason = "balas_ok"
+                                else:
+                                    stats["ai_amb"] += 1
+                                    reason = "ambiguous"
+                    else:
+                        label, conf, reason = "pembeli", 1.0, "balas_ok"
+
+                    if reason != "balas_ok":
+                        if log_preds:
+                            log_ai_decision(tid, label, conf, True, reason, norm_text)
+                        continue
+
+                    if dry_run:
+                        if log_preds:
+                            log_ai_decision(tid, label, conf, True, "dry_run", norm_text)
                         continue
 
                     await btn.click()
@@ -246,6 +348,8 @@ async def run():
                     await page.click("[data-testid='tweetButton']")
                     replied.append(tid); save_replied(replied)
                     stats["replied"] += 1
+                    if log_preds:
+                        log_ai_decision(tid, label, conf, True, "balas_ok", norm_text)
 
             except Exception as e:
                 console.print(f"[bold red]FATAL:[/] {e}")
