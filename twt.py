@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import logging
 import sys
 import tempfile
 import time
@@ -110,6 +111,16 @@ def build_search_url(cfg: Dict[str, Any]) -> str:
     if live:
         url += "&f=live"
     return url
+
+
+def load_hf_token(path: str = "tokens.json") -> Optional[str]:
+    """Load Hugging Face API token from JSON file."""
+    data = load_json(path)
+    if isinstance(data, dict):
+        token = data.get("hf_api_token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    return None
 
 
 def load_replied() -> List[int]:
@@ -413,6 +424,7 @@ def render_dashboard(
     lines = [f"Terlalu Lama: {stats.get('age', 0)}"]
     if status.get("ai_enabled"):
         lines.append(f"Ambigu AI: {stats.get('ai_amb', 0)}")
+        lines.append(f"AI Fallback: {stats.get('ai_disabled', 0)}")
     last = status.get("last_activity")
     if last:
         user, ts = last
@@ -451,6 +463,13 @@ async def run() -> None:
     cfg = load_config()
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
+
+    if not os.environ.get("HF_API_TOKEN"):
+        token = load_hf_token()
+        if token:
+            os.environ["HF_API_TOKEN"] = token
+        else:
+            logging.warning("HF API token tidak ditemukan; klasifikasi AI mungkin gagal")
 
     pos_kws = cfg.get("positive_keywords", [])
     neg_kws = cfg.get("negative_keywords", [])
@@ -532,12 +551,13 @@ async def run() -> None:
                         if ai_enabled and ai_client:
                             res = await ai_client.classify(norm_text, ai_labels)
                             if res is None:
-                                stats["ai_err"] = stats.get("ai_err", 0) + 1
-                                continue
-                            label, conf = res
-                            if label != "pembeli" or conf < ai_threshold:
-                                stats["ai_amb"] = stats.get("ai_amb", 0) + 1
-                                continue
+                                stats["ai_disabled"] = stats.get("ai_disabled", 0) + 1
+                                logging.warning("AI classification unavailable; proceeding without filter")
+                            else:
+                                label, conf = res
+                                if label != "pembeli" or conf < ai_threshold:
+                                    stats["ai_amb"] = stats.get("ai_amb", 0) + 1
+                                    continue
 
                         res = await attempt_reply(page, cand, reply_msg, reply_cfg, state, replied, stats, timers)
                         record_decision(cand, res)
