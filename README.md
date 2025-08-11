@@ -9,7 +9,7 @@ yang layak dibalas.
 
 - Memindai tweet terbaru sesuai kata kunci pencarian.
 - Prefilter kata positif/negatif yang didefinisikan pada `bot_config.json`.
-- Dukungan klasifikasi *zero-shot* melalui Hugging Face (token disimpan pada `tokens.json`).
+- Dukungan klasifikasi *zero-shot* melalui Hugging Face (token dibaca dari `tokens.json` atau variabel lingkungan `HF_API_TOKEN`).
 - Menampilkan statistik proses dan penggunaan sistem.
 - Penanganan CAPTCHA secara manual.
 
@@ -27,13 +27,18 @@ yang layak dibalas.
 
 2. **Konfigurasi**
 
-   Sunting `bot_config.json` sesuai kebutuhan. Jika ingin mengaktifkan
-   klasifikasi AI, isi file `tokens.json` dengan token API Hugging Face.
+   Sunting `bot_config.json` sesuai kebutuhan. Untuk mengaktifkan
+   klasifikasi AI, sediakan token Hugging Face melalui file `tokens.json`
+   **atau** set variabel lingkungan `HF_API_TOKEN` sebelum menjalankan bot.
 
 ## Menjalankan Bot
 
 ```bash
+# memakai tokens.json
 python twt.py
+
+# atau langsung lewat variabel lingkungan
+HF_API_TOKEN=hf_xxx python twt.py
 ```
 
 Bot akan membuka jendela browser dan mulai memindai tweet. Hentikan dengan
