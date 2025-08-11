@@ -15,11 +15,11 @@ from rich.align import Align
 from rich.table import Table
 from rich.text import Text
 
+# Responda uses HF API via ZeroShotClient
 from ai import ZeroShotClient
 
 # ---- KONFIGURASI ----
 CONFIG_PATH  = "bot_config.json"
-TOKEN_PATH   = "tokens.json"
 REPLIED_LOG  = "replied_ids.json"
 SESSION_DIR  = "bot_session"
 COOKIE_FILE  = "session.json"
@@ -61,10 +61,6 @@ def build_search_url(cfg: dict) -> str:
     if live:
         url += "&f=live"
     return url
-
-def load_tokens():
-    data = load_json(TOKEN_PATH)
-    return data if isinstance(data, dict) else {}
 
 def load_replied():
     data = load_json(REPLIED_LOG)
@@ -247,11 +243,7 @@ async def run():
     log_preds    = cfg.get("log_predictions", True)
     dry_run      = cfg.get("dry_run", False)
 
-    tokens   = load_tokens()
-    hf_token = tokens.get("hf_api_token")
-    ai_client = None
-    if ai_enabled and hf_token:
-        ai_client = ZeroShotClient(ai_model, hf_token, timeout_ms=ai_timeout)
+    ai_client = ZeroShotClient(ai_model, timeout_ms=ai_timeout) if ai_enabled else None
 
     replied = load_replied()
     last_id = 0
@@ -328,35 +320,50 @@ async def run():
                     label = None
                     conf = 0.0
                     reason = ""
+                    prefilter_pass = True
 
                     if ai_enabled:
                         if not ai_client:
                             stats["ai_skip"] += 1
-                            reason = "ai_disabled"
+                            prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
+                            if prefilter_pass:
+                                label, conf, reason = "pembeli", 1.0, "balas_ok"
+                            else:
+                                stats["kw"] += 1
+                                reason = "prefilter_fail"
                         else:
                             stats["ai_calls"] += 1
                             res = await ai_client.classify(norm_text, ai_labels)
-                            if not res:
+                            if res is None:
                                 stats["ai_err"] += 1
-                                reason = "error_ai"
+                                prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
+                                if prefilter_pass:
+                                    label, conf, reason = "pembeli", 1.0, "balas_ok"
+                                else:
+                                    reason = "ai_error"
                             else:
                                 label, conf = res
                                 if label == "pembeli" and conf >= ai_threshold:
                                     reason = "balas_ok"
                                 else:
                                     stats["ai_amb"] += 1
-                                    reason = "ambiguous"
+                                    reason = "ai_conf_low"
                     else:
-                        label, conf, reason = "pembeli", 1.0, "balas_ok"
+                        prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
+                        if prefilter_pass:
+                            label, conf, reason = "pembeli", 1.0, "balas_ok"
+                        else:
+                            stats["kw"] += 1
+                            reason = "prefilter_fail"
 
                     if reason != "balas_ok":
                         if log_preds:
-                            log_ai_decision(tid, label, conf, True, reason, norm_text)
+                            log_ai_decision(tid, label, conf, prefilter_pass, reason, norm_text)
                         continue
 
                     if dry_run:
                         if log_preds:
-                            log_ai_decision(tid, label, conf, True, "dry_run", norm_text)
+                            log_ai_decision(tid, label, conf, prefilter_pass, "dry_run", norm_text)
                         continue
 
                     await btn.click()
