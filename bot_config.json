@@ -109,5 +109,25 @@
   "ai_timeout_ms": 4000,
   "pre_filter_keywords": true,
   "log_predictions": true,
-  "dry_run": false
+  "scan": {
+    "scan_interval_ms": 1500,
+    "no_new_cycles_before_refresh": 6,
+    "max_age_hours": 3
+  },
+  "network": {
+    "timeout_ms": 15000,
+    "max_retries": 3,
+    "retry_backoff_ms": 1200
+  },
+  "reply": {
+    "click_timeout_ms": 2500,
+    "composer_timeout_ms": 3000,
+    "submit_timeout_ms": 4000,
+    "dry_run": false
+  },
+  "dashboard": {
+    "compact": true,
+    "show_url": true,
+    "interactive_keys": true
+  }
 }
