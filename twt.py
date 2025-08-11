@@ -483,9 +483,6 @@ async def run() -> None:
     cfg = load_config()
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
-
-    ensure_hf_token()
-
     pos_kws = cfg.get("positive_keywords", [])
     neg_kws = cfg.get("negative_keywords", [])
     reply_msg = cfg.get("reply_message", "")
@@ -497,6 +494,9 @@ async def run() -> None:
     ai_timeout = cfg.get("ai_timeout_ms", 4000)
     pre_filter = cfg.get("pre_filter_keywords", True)
     log_preds = cfg.get("log_predictions", True)
+
+    if ai_enabled:
+        ensure_hf_token()
 
     scan_cfg = cfg["scan"]
     net_cfg = cfg["network"]
