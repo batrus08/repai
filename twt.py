@@ -1,172 +1,135 @@
 #!/usr/bin/env python3
-import sys, os, json, asyncio, unicodedata
-from datetime import datetime, timedelta, timezone
+"""Bot balas X/Twitter dengan Playwright.
 
-from playwright.async_api import async_playwright, TimeoutError
-import psutil, pyfiglet
-from urllib.parse import quote  # for URL encoding
+Fitur utama:
+* Soft-scan: memindai DOM tanpa reload setiap siklus.
+* Smart refresh: reload hanya saat stagnan atau dipaksa.
+* Health-check sesi otomatis & login resilient.
+* Prioritas kandidat berdasarkan waktu.
+* Dashboard Rich 5 kolom dengan kontrol interaktif.
+* Anti duplikasi balasan menggunakan log id atomik.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+from urllib.parse import quote
+
+from playwright.async_api import TimeoutError, async_playwright
 
 from rich import box
-from rich.console import Console, Group
+from rich.console import Console
 from rich.live import Live
-from rich.layout import Layout
 from rich.panel import Panel
-from rich.align import Align
 from rich.table import Table
 from rich.text import Text
 
-# Responda uses HF API via ZeroShotClient
 from ai import ZeroShotClient
-
-# ---- KONFIGURASI ----
-CONFIG_PATH  = "bot_config.json"
-REPLIED_LOG  = "replied_ids.json"
-SESSION_DIR  = "bot_session"
-COOKIE_FILE  = "session.json"
-MAX_AGE_HRS  = 3    # hanya balas tweet ≤ 3 jam
-LOOP_SEC     = 15   # jeda antar loop (detik)
-
-# Default search URL example (will be rebuilt from config)
-SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
 
 console = Console()
 
-def load_json(path):
+# ---------------- Konfigurasi & util dasar -----------------
+
+CONFIG_PATH = "bot_config.json"
+REPLIED_LOG = "replied_ids.json"
+SESSION_DIR = "bot_session"
+COOKIE_FILE = "session.json"
+
+DEFAULT_SCAN = {
+    "scan_interval_ms": 1500,
+    "no_new_cycles_before_refresh": 6,
+    "max_age_hours": 3,
+}
+
+DEFAULT_NETWORK = {
+    "timeout_ms": 15000,
+    "max_retries": 3,
+    "retry_backoff_ms": 1200,
+}
+
+DEFAULT_REPLY = {
+    "click_timeout_ms": 2500,
+    "composer_timeout_ms": 3000,
+    "submit_timeout_ms": 4000,
+    "dry_run": False,
+}
+
+DEFAULT_DASHBOARD = {
+    "compact": True,
+    "show_url": True,
+    "interactive_keys": True,
+}
+
+# Default search URL akan dibangun ulang dari config
+SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
+
+
+def load_json(path: str) -> Optional[Any]:
     if not os.path.exists(path):
         return None
     try:
-        return json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except json.JSONDecodeError:
         return None
 
-def load_config():
+
+def load_config() -> Dict[str, Any]:
     cfg = load_json(CONFIG_PATH)
     if not isinstance(cfg, dict):
-        console.print(f"[bold red]ERROR:[/] Gagal baca/parse `{CONFIG_PATH}`.")
+        console.print(f"[bold red]ERROR:[/] Gagal baca `{CONFIG_PATH}`")
         sys.exit(1)
+
+    cfg["scan"] = {**DEFAULT_SCAN, **cfg.get("scan", {})}
+    cfg["network"] = {**DEFAULT_NETWORK, **cfg.get("network", {})}
+    cfg["reply"] = {**DEFAULT_REPLY, **cfg.get("reply", {})}
+    cfg["dashboard"] = {**DEFAULT_DASHBOARD, **cfg.get("dashboard", {})}
     return cfg
 
 
-def build_search_url(cfg: dict) -> str:
-    """Bentuk URL pencarian X berdasarkan konfigurasi."""
+def build_search_url(cfg: Dict[str, Any]) -> str:
     sc = cfg.get("search_config") or {}
-
     keyword = sc.get("keyword", "chatgpt")
     hashtag = sc.get("hashtag", "zonauang")
     src = sc.get("src", "recent_search_click")
     live = sc.get("live", True)
 
-    query = quote(f"{keyword} #{hashtag}")  # encode spasi dan tanda '#'
+    query = quote(f"{keyword} #{hashtag}")
     url = f"https://x.com/search?q={query}&src={quote(src)}"
     if live:
         url += "&f=live"
     return url
 
-def load_replied():
+
+def load_replied() -> List[int]:
     data = load_json(REPLIED_LOG)
     return data if isinstance(data, list) else []
 
-def save_replied(ids):
-    json.dump(ids, open(REPLIED_LOG, "w", encoding="utf-8"), indent=2)
 
-async def wait_for_manual_captcha():
-    console.print("[bold yellow]⚠️ CAPTCHA terdeteksi![/] Selesaikan di browser lalu tekan Enter…")
-    await asyncio.to_thread(input)
-
-async def detect_captcha(page, stats=None):
-    u = page.url.lower()
-    if "captcha" in u or "challenge" in u:
-        if stats is not None:
-            stats["captcha"] += 1
-        await wait_for_manual_captcha()
-    else:
-        try:
-            if await page.query_selector("iframe[src*='captcha']"):
-                if stats is not None:
-                    stats["captcha"] += 1
-                await wait_for_manual_captcha()
-        except TimeoutError:
-            pass
-
-async def detect_rate_limit(page, stats=None):
-    try:
-        if await page.query_selector("text='Rate limit exceeded'"):
-            if stats is not None:
-                stats["rate"] += 1
-            return True
-    except TimeoutError:
-        pass
-    return False
-
-def render_banner() -> Text:
-    art = pyfiglet.figlet_format("Meowlie Bot", font="slant")
-    width = console.size.width
-    centered = "\n".join(line.center(width) for line in art.splitlines())
-    return Text(centered, style="bold green")
-
-def render_summary(stats, last_activity) -> Group:
-    table = Table(
-        expand=True,
-        box=box.SIMPLE_HEAVY,
-        show_header=True,
-        header_style="bold cyan",
-        show_lines=False
-    )
-    cols = [
-        ("🔍 Ditemukan", stats["scanned"]),
-        ("🎯 Calon Balas", stats["cand"]),
-        ("✅ Sudah Balas", stats["replied"]),
-        ("🪤 Skip Kata", stats["kw"]),
-        ("🚫 Skip Tombol", stats["btn"]),
-    ]
-    for header, _ in cols:
-        table.add_column(header, justify="center")
-    table.add_row(*(str(v) for _, v in cols))
-
-    lines = [f"Terlalu Lama: {stats['age']}"]
-    if last_activity:
-        user, ts = last_activity
-        lines.append(f"Aktivitas terakhir: @{user} - {ts.strftime('%H:%M:%S')}")
-    else:
-        lines.append("Aktivitas terakhir: -")
-    if stats.get("captcha"):
-        lines.append(f"Captcha: {stats['captcha']}")
-    if stats.get("rate"):
-        lines.append(f"Rate-limit: {stats['rate']}")
-    if stats.get("ai_err"):
-        lines.append(f"AI error: {stats['ai_err']}")
-
-    return Group(table, Text("\n".join(lines), style="dim"))
-
-def render_system() -> Table:
-    cpu = psutil.cpu_percent(interval=None)
-    mem = psutil.virtual_memory().percent
-    table = Table(
-        expand=True,
-        box=box.SIMPLE_HEAVY,
-        show_header=False
-    )
-    table.add_column("", justify="center")
-    table.add_column("", justify="center")
-    table.add_row(f"🖥️ CPU {cpu:.1f}%", f"💾 RAM {mem:.1f}%")
-    return table
-
-def render_marquee(offset: int) -> Text:
-    msg = "😻 Meowlie Bot · Balas Otomatis #zonauang 😻"
-    width = console.size.width - 4
-    s = msg + "   "
-    big = s * ((width // len(s)) + 2)
-    pos = offset % len(s)
-    return Text(big[pos:pos+width], style="dim")
+def save_replied(ids: List[int]) -> None:
+    tmp = REPLIED_LOG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ids, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, REPLIED_LOG)
 
 
 def normalize_text(text: str) -> str:
-    """Normalisasi unicode dan huruf kecil."""
     return unicodedata.normalize("NFKC", text).lower().strip()
 
 
-def passes_prefilter(text: str, pos_keywords, neg_keywords) -> bool:
-    """Saring cepat berdasarkan keyword positif/negatif."""
+def passes_prefilter(text: str, pos_keywords: List[str], neg_keywords: List[str]) -> bool:
     if not text:
         return False
     t = normalize_text(text)
@@ -179,15 +142,208 @@ def passes_prefilter(text: str, pos_keywords, neg_keywords) -> bool:
     return True
 
 
-def log_ai_decision(tid, label, conf, prefilter_pass, reason, text, path="ai_decisions.log"):
+async def wait_for_manual_captcha() -> None:
+    console.print("[bold yellow]⚠️ CAPTCHA terdeteksi. Selesaikan di browser dan tekan Enter…[/]")
+    await asyncio.to_thread(input)
+
+
+async def detect_captcha(page, stats: Optional[Dict[str, int]] = None) -> None:
+    u = page.url.lower()
+    if "captcha" in u or "challenge" in u:
+        if stats is not None:
+            stats["captcha"] = stats.get("captcha", 0) + 1
+        await wait_for_manual_captcha()
+        return
+    try:
+        if await page.query_selector("iframe[src*='captcha']"):
+            if stats is not None:
+                stats["captcha"] = stats.get("captcha", 0) + 1
+            await wait_for_manual_captcha()
+    except TimeoutError:
+        pass
+
+
+async def detect_rate_limit(page, stats: Optional[Dict[str, int]] = None) -> bool:
+    try:
+        if await page.query_selector("text='Rate limit exceeded'"):
+            if stats is not None:
+                stats["rate"] = stats.get("rate", 0) + 1
+            return True
+    except TimeoutError:
+        pass
+    return False
+
+
+# ------------------- Data kelas -------------------
+
+
+@dataclass
+class Candidate:
+    tid: int
+    author: str
+    created_at: datetime
+    element: Any
+    text: str
+
+
+@dataclass
+class ReplyResult:
+    action: str  # "reply" atau "skip"
+    reason: str
+    durations: Dict[str, int] = field(default_factory=dict)
+
+
+# ----------------- Login & navigasi -----------------
+
+
+async def ensure_logged_in(page) -> bool:
+    """Pastikan sesi login aktif. Kembalikan True jika sudah login."""
+    try:
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=5000)
+        return True
+    except TimeoutError:
+        pass
+    await page.goto("https://x.com/login")
+    try:
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=120000)
+        await page.context.storage_state(path=COOKIE_FILE)
+        return True
+    except TimeoutError:
+        return False
+
+
+async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
+    """Pergi ke URL dengan retry dan backoff."""
+    for attempt in range(net_cfg["max_retries"]):
+        try:
+            await page.goto(url, timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
+            await detect_captcha(page, stats)
+            return True
+        except Exception:
+            await asyncio.sleep(net_cfg["retry_backoff_ms"] / 1000 * (attempt + 1))
+    return False
+
+
+# ----------------- Pemindaian & prioritas -----------------
+
+
+async def soft_scan_cycle(
+    page,
+    scan_cfg: Dict[str, int],
+    replied: set[int],
+    seen_ids: set[int],
+    stats: Dict[str, int],
+) -> List[Candidate]:
+    """Scan DOM untuk tweet baru tanpa reload."""
+    candidates: List[Candidate] = []
+    arts = await page.query_selector_all("article")
+    stats["found"] = stats.get("found", 0) + len(arts)
+
+    for art in arts:
+        link = await art.query_selector("a[href*='/status/']")
+        if not link:
+            continue
+        href = await link.get_attribute("href")
+        if not href:
+            continue
+        try:
+            tid = int(href.split("/")[-1])
+        except ValueError:
+            continue
+        user = href.split("/")[1]
+        if tid in seen_ids or tid in replied:
+            continue
+        tm = await art.query_selector("time")
+        if not tm:
+            continue
+        ts = await tm.get_attribute("datetime")
+        if not ts:
+            continue
+        created = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - created
+        if age > timedelta(hours=scan_cfg["max_age_hours"]):
+            stats["age"] = stats.get("age", 0) + 1
+            seen_ids.add(tid)
+            continue
+        text = await art.inner_text()
+        candidates.append(Candidate(tid, user, created, art, text))
+        seen_ids.add(tid)
+
+    # scroll ringan untuk memunculkan item baru
+    await page.mouse.wheel(0, 1000)
+    return candidates
+
+
+def prioritize(candidates: List[Candidate]) -> List[Candidate]:
+    return sorted(candidates, key=lambda c: c.created_at, reverse=True)
+
+
+# ------------------- Balasan & log --------------------
+
+
+async def attempt_reply(
+    page,
+    cand: Candidate,
+    reply_msg: str,
+    reply_cfg: Dict[str, int],
+    state: Dict[str, Any],
+    replied: set[int],
+    stats: Dict[str, int],
+    timers: Dict[str, List[int]],
+) -> ReplyResult:
+    if cand.tid in replied:
+        stats["duplicate"] = stats.get("duplicate", 0) + 1
+        return ReplyResult("skip", "duplicate")
+
+    btn = await cand.element.query_selector("[data-testid='reply']")
+    if not btn or await btn.get_attribute("aria-disabled") == "true":
+        stats["skip_tombol"] = stats.get("skip_tombol", 0) + 1
+        return ReplyResult("skip", "skip_tombol")
+
+    t0 = time.perf_counter()
+    try:
+        await btn.click(timeout=reply_cfg["click_timeout_ms"])
+        t1 = time.perf_counter()
+        await page.wait_for_selector("div[role='textbox']", timeout=reply_cfg["composer_timeout_ms"])
+        t2 = time.perf_counter()
+        await page.fill("div[role='textbox']", reply_msg)
+        if state["dry_run"]:
+            await page.keyboard.press("Escape")
+            return ReplyResult("skip", "dry_run", {
+                "candidate_to_click": int((t1 - t0) * 1000),
+                "click_to_textbox": int((t2 - t1) * 1000),
+            })
+        await page.click("[data-testid='tweetButton']", timeout=reply_cfg["submit_timeout_ms"])
+        t3 = time.perf_counter()
+    except TimeoutError:
+        stats["net_error"] = stats.get("net_error", 0) + 1
+        return ReplyResult("skip", "net_error")
+
+    durations = {
+        "candidate_to_click": int((t1 - t0) * 1000),
+        "click_to_textbox": int((t2 - t1) * 1000),
+        "textbox_to_submit": int((t3 - t2) * 1000),
+    }
+    for k, v in durations.items():
+        timers.setdefault(k, []).append(v)
+        if len(timers[k]) > 10:
+            timers[k] = timers[k][-10:]
+
+    replied.add(cand.tid)
+    save_replied(list(replied))
+    stats["replied"] = stats.get("replied", 0) + 1
+    return ReplyResult("reply", "balas_ok", durations)
+
+
+def record_decision(cand: Candidate, res: ReplyResult, path: str = "decisions.log") -> None:
     data = {
         "ts": datetime.utcnow().isoformat() + "Z",
-        "tweet_id": tid,
-        "label": label,
-        "confidence": conf,
-        "prefilter_pass": prefilter_pass,
-        "reason": reason,
-        "text_sample": text[:200],
+        "tweet_id": cand.tid,
+        "author": cand.author,
+        "age_min": int((datetime.now(timezone.utc) - cand.created_at).total_seconds() / 60),
+        "action": res.action,
+        "reason": res.reason,
+        "dur_ms": res.durations,
     }
     try:
         with open(path, "a", encoding="utf-8") as f:
@@ -196,245 +352,207 @@ def log_ai_decision(tid, label, conf, prefilter_pass, reason, text, path="ai_dec
     except Exception:
         pass
 
-def build_layout(stats, timer, offset, last_activity) -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=7),
-        Layout(name="body",   ratio=2),
-        Layout(name="footer", size=3),
-    )
 
-    # HEADER
-    banner = render_banner()
-    now    = datetime.now().strftime("%H:%M:%S")
-    wpanel = Panel(now, title="⏰ Waktu", border_style="bright_blue")
-    tpanel = Panel(f"{timer}s", title="⏳ Timer", border_style="bright_yellow")
-    row = Layout()
-    row.split_row(Layout(wpanel, ratio=1), Layout(tpanel, ratio=1))
+def record_cycle(
+    cycle: int, found: int, new_candidates: int, dur_ms: int, refreshed: bool, path: str = "cycles.log"
+) -> None:
+    data = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "cycle": cycle,
+        "found": found,
+        "new_candidates": new_candidates,
+        "scan_cycle_ms": dur_ms,
+        "refreshed": refreshed,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception:
+        pass
 
-    layout["header"].update(
-        Panel(
-            Group(
-                Align.center(banner),
-                Align.center(row)
-            ),
-            border_style="bright_green",
-            padding=0
-        )
-    )
 
-    # BODY
-    summary_pan = Panel(render_summary(stats, last_activity),
-                        title="🐾 Summary",
-                        border_style="cyan",
-                        padding=(1,1))
-    system_pan  = Panel(render_system(),
-                        title="⚙️ System",
-                        border_style="magenta",
-                        padding=(1,1))
-    body = Layout()
-    body.split_row(
-        Layout(summary_pan, ratio=3),
-        Layout(system_pan,  ratio=2),
-    )
-    layout["body"].update(body)
+# ---------------- Dashboard & input -----------------
 
-    # FOOTER
-    layout["footer"].update(
-        Panel(render_marquee(offset),
-              border_style="bright_black",
-              padding=(0,1))
-    )
 
-    return layout
+def render_dashboard(
+    stats: Dict[str, int],
+    timers: Dict[str, List[int]],
+    status: Dict[str, Any],
+) -> Panel:
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    headers = [
+        "Ditemukan",
+        "Calon Balas",
+        "Sudah Balas",
+        "Skip Kata",
+        "Skip Tombol",
+    ]
+    for h in headers:
+        table.add_column(h, justify="center")
+    row = [
+        str(stats.get("found", 0)),
+        str(stats.get("cand", 0)),
+        str(stats.get("replied", 0)),
+        str(stats.get("skip_kata", 0)),
+        str(stats.get("skip_tombol", 0)),
+    ]
+    table.add_row(*row)
 
-async def run():
+    lines = [f"Terlalu Lama: {stats.get('age', 0)}"]
+    if status.get("ai_enabled"):
+        lines.append(f"Ambigu AI: {stats.get('ai_amb', 0)}")
+    last = status.get("last_activity")
+    if last:
+        user, ts = last
+        lines.append(f"Aktivitas Terakhir: @{user} {ts.strftime('%H:%M:%S')}")
+    else:
+        lines.append("Aktivitas Terakhir: -")
+    if status.get("url"):
+        login = "OK" if status.get("logged_in") else "LOGIN"
+        lines.append(f"URL: {status['url']} ({login})")
+
+    # tampilkan rata-rata durasi
+    if timers.get("scan_cycle"):
+        avg = sum(timers["scan_cycle"]) / len(timers["scan_cycle"])
+        lines.append(f"Rata scan: {avg:.0f} ms")
+
+    return Panel(Text("\n".join(lines)), title=None, subtitle_align="left", renderable=table, padding=0)
+
+
+async def key_listener(state: Dict[str, Any]) -> None:
+    """Listener non-blocking untuk input keyboard."""
+    while True:
+        ch = await asyncio.to_thread(sys.stdin.read, 1)
+        ch = ch.strip().lower()
+        if ch == "p":
+            state["paused"] = not state["paused"]
+        elif ch == "r":
+            state["force_refresh"] = True
+        elif ch == "d":
+            state["dry_run"] = not state["dry_run"]
+        elif ch == "q":
+            state["quit"] = True
+
+
+# ----------------------------- Main loop -----------------------------
+
+
+async def run() -> None:
     cfg = load_config()
     global SEARCH_URL
-    SEARCH_URL = build_search_url(cfg)  # bangun URL pencarian dari config
+    SEARCH_URL = build_search_url(cfg)
+
     pos_kws = cfg.get("positive_keywords", [])
     neg_kws = cfg.get("negative_keywords", [])
-    reply   = cfg.get("reply_message", "")
+    reply_msg = cfg.get("reply_message", "")
 
-    ai_enabled   = cfg.get("ai_enabled", False)
-    ai_model     = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
-    ai_labels    = cfg.get("ai_candidate_labels", ["pembeli", "penjual", "lainnya"])
+    ai_enabled = cfg.get("ai_enabled", False)
+    ai_model = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
+    ai_labels = cfg.get("ai_candidate_labels", ["pembeli", "penjual", "lainnya"])
     ai_threshold = cfg.get("ai_threshold", 0.8)
-    ai_timeout   = cfg.get("ai_timeout_ms", 4000)
-    pre_filter   = cfg.get("pre_filter_keywords", True)
-    log_preds    = cfg.get("log_predictions", True)
-    dry_run      = cfg.get("dry_run", False)
+    ai_timeout = cfg.get("ai_timeout_ms", 4000)
+    pre_filter = cfg.get("pre_filter_keywords", True)
+    log_preds = cfg.get("log_predictions", True)
+
+    scan_cfg = cfg["scan"]
+    net_cfg = cfg["network"]
+    reply_cfg = cfg["reply"]
 
     ai_client = ZeroShotClient(ai_model, timeout_ms=ai_timeout) if ai_enabled else None
 
-    replied = load_replied()
-    last_id = 0
-    last_activity = None
-    stats   = {k:0 for k in ("scanned","cand","replied","age","kw","btn","ai_calls","ai_skip","ai_amb","ai_err","captcha","rate")}
+    replied = set(load_replied())
+    seen_ids: set[int] = set()
+    stats: Dict[str, int] = {}
+    timers: Dict[str, List[int]] = {"scan_cycle": []}
+    state = {"paused": False, "force_refresh": False, "dry_run": reply_cfg.get("dry_run", False), "quit": False}
+    last_activity: Optional[tuple[str, datetime]] = None
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch_persistent_context(
-        user_data_dir=SESSION_DIR,
-        headless=False,
-        args=["--start-maximized"]
+        user_data_dir=SESSION_DIR, headless=False, args=["--start-maximized"]
     )
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
-    if not os.path.exists(COOKIE_FILE):
-        console.print("[green]🔐 Silakan login ke X…[/]")
-        await page.goto("https://x.com/login")
-        try:
-            await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=120000)
-            await page.context.storage_state(path=COOKIE_FILE)
-        except TimeoutError:
-            console.print("[red]Gagal memverifikasi login.[/]")
-    else:
-        await page.goto("https://x.com/home")
-        try:
-            await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=15000)
-        except TimeoutError:
-            console.print("[red]⚠️ Verifikasi login gagal.[/]")
+    await ensure_logged_in(page)
+    await resilient_goto(page, SEARCH_URL, net_cfg, stats)
 
-    await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-    await detect_captcha(page, stats)
-    await detect_rate_limit(page, stats)
-    await asyncio.sleep(1)
+    if cfg["dashboard"].get("interactive_keys", True):
+        asyncio.create_task(key_listener(state))
 
-    layout = build_layout(stats, LOOP_SEC, offset=0, last_activity=last_activity)
-    with Live(layout, console=console, screen=True, refresh_per_second=10) as live:
-        offset = 0
-        while True:
-            try:
-                arts = await page.query_selector_all("article")
-                stats["scanned"] += len(arts)
+    cycle = 0
+    no_new = 0
 
-                items = []
-                for art in arts:
-                    link = await art.query_selector("a[href*='/status/']")
-                    if not link:
-                        continue
-                    href = await link.get_attribute("href")
-                    tid = int(href.split("/")[-1])
-                    user = href.split("/")[1]
-                    if tid <= last_id or tid in replied:
-                        continue
-                    tm = await art.query_selector("time")
-                    if not tm:
-                        continue
-                    ts = await tm.get_attribute("datetime")
-                    ttime = datetime.fromisoformat(ts.replace("Z","+00:00"))
-                    items.append((ttime, tid, art, user))
+    with Live(console=console, refresh_per_second=4, screen=True) as live:
+        while not state["quit"]:
+            start = time.perf_counter()
+            logged_in = await ensure_logged_in(page)
+            if not logged_in:
+                await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+            refreshed = False
 
-                items.sort(key=lambda x: x[0], reverse=True)
-                stats["cand"] += len(items)
-
-                for ttime, tid, art, user in items:
-                    last_id = max(last_id, tid)
-                    if datetime.now(timezone.utc) - ttime > timedelta(hours=MAX_AGE_HRS):
-                        stats["age"] += 1
-                        continue
-
-                    raw_text = await art.inner_text()
-                    norm_text = normalize_text(raw_text)
-                    if len(norm_text) < 5:
-                        stats["kw"] += 1
-                        if log_preds:
-                            log_ai_decision(tid, None, 0.0, False, "too_short", norm_text)
-                        continue
-                    if pre_filter and not passes_prefilter(norm_text, pos_kws, neg_kws):
-                        stats["kw"] += 1
-                        if log_preds:
-                            log_ai_decision(tid, None, 0.0, False, "prefilter_fail", norm_text)
-                        continue
-
-                    btn = await art.query_selector("[data-testid='reply']")
-                    if not btn or await btn.get_attribute("aria-disabled") == "true":
-                        stats["btn"] += 1
-                        console.log(f"Skip Tombol: {tid}")
-                        continue
-
-                    label = None
-                    conf = 0.0
-                    reason = ""
-                    prefilter_pass = True
-
-                    if ai_enabled:
-                        if not ai_client:
-                            stats["ai_skip"] += 1
-                            prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
-                            if prefilter_pass:
-                                label, conf, reason = "pembeli", 1.0, "balas_ok"
-                            else:
-                                stats["kw"] += 1
-                                reason = "prefilter_fail"
-                        else:
-                            stats["ai_calls"] += 1
+            new_candidates: List[Candidate] = []
+            if not state["paused"]:
+                try:
+                    cands = await soft_scan_cycle(page, scan_cfg, replied, seen_ids, stats)
+                    stats["cand"] = stats.get("cand", 0) + len(cands)
+                    for cand in prioritize(cands):
+                        norm_text = normalize_text(cand.text)
+                        if pre_filter and not passes_prefilter(norm_text, pos_kws, neg_kws):
+                            stats["skip_kata"] = stats.get("skip_kata", 0) + 1
+                            continue
+                        label = "pembeli"
+                        conf = 1.0
+                        if ai_enabled and ai_client:
                             res = await ai_client.classify(norm_text, ai_labels)
                             if res is None:
-                                stats["ai_err"] += 1
-                                prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
-                                if prefilter_pass:
-                                    label, conf, reason = "pembeli", 1.0, "balas_ok"
-                                else:
-                                    reason = "ai_error"
-                            else:
-                                label, conf = res
-                                if label == "pembeli" and conf >= ai_threshold:
-                                    reason = "balas_ok"
-                                else:
-                                    stats["ai_amb"] += 1
-                                    reason = "ai_conf_low"
-                    else:
-                        prefilter_pass = passes_prefilter(norm_text, pos_kws, neg_kws)
-                        if prefilter_pass:
-                            label, conf, reason = "pembeli", 1.0, "balas_ok"
-                        else:
-                            stats["kw"] += 1
-                            reason = "prefilter_fail"
+                                stats["ai_err"] = stats.get("ai_err", 0) + 1
+                                continue
+                            label, conf = res
+                            if label != "pembeli" or conf < ai_threshold:
+                                stats["ai_amb"] = stats.get("ai_amb", 0) + 1
+                                continue
 
-                    if reason != "balas_ok":
-                        if log_preds:
-                            log_ai_decision(tid, label, conf, prefilter_pass, reason, norm_text)
-                        continue
+                        res = await attempt_reply(page, cand, reply_msg, reply_cfg, state, replied, stats, timers)
+                        record_decision(cand, res)
+                        if res.action == "reply":
+                            last_activity = (cand.author, datetime.now())
+                    new_candidates = cands
+                except Exception:
+                    # loop resilien: lanjut saja
+                    pass
 
-                    if dry_run:
-                        if log_preds:
-                            log_ai_decision(tid, label, conf, prefilter_pass, "dry_run", norm_text)
-                        continue
+            dur = int((time.perf_counter() - start) * 1000)
+            timers["scan_cycle"].append(dur)
+            if len(timers["scan_cycle"]) > 10:
+                timers["scan_cycle"] = timers["scan_cycle"][-10:]
 
-                    await btn.click()
-                    await detect_captcha(page, stats)
-                    await detect_rate_limit(page, stats)
-                    try:
-                        await page.wait_for_selector("div[role='textbox']", timeout=5000)
-                    except TimeoutError:
-                        continue
+            if not new_candidates:
+                no_new += 1
+                if state["force_refresh"] or no_new >= scan_cfg["no_new_cycles_before_refresh"]:
+                    await page.reload()
+                    refreshed = True
+                    state["force_refresh"] = False
+                    no_new = 0
+            else:
+                no_new = 0
 
-                    await page.fill("div[role='textbox']", reply)
-                    await page.click("[data-testid='tweetButton']")
-                    replied.append(tid); save_replied(replied)
-                    stats["replied"] += 1
-                    last_activity = (user, datetime.now())
-                    if log_preds:
-                        log_ai_decision(tid, label, conf, True, "balas_ok", norm_text)
+            status = {
+                "last_activity": last_activity,
+                "url": SEARCH_URL,
+                "logged_in": logged_in,
+                "ai_enabled": ai_enabled,
+            }
+            live.update(render_dashboard(stats, timers, status))
 
-            except Exception as e:
-                console.print(f"[bold red]FATAL:[/] {e}")
-                break
+            cycle += 1
+            record_cycle(cycle, len(new_candidates), len(new_candidates), dur, refreshed)
 
-            for rem in range(LOOP_SEC, 0, -1):
-                layout = build_layout(stats, rem, offset, last_activity)
-                live.update(layout)
-                await asyncio.sleep(1)
-                offset += 1
-
-            await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-            await detect_captcha(page, stats)
-            await detect_rate_limit(page, stats)
-            await asyncio.sleep(1)
+            await asyncio.sleep(scan_cfg["scan_interval_ms"] / 1000)
 
     await browser.close()
     await pw.stop()
+
 
 if __name__ == "__main__":
     try:
@@ -444,3 +562,4 @@ if __name__ == "__main__":
     except Exception as e:
         console.print(f"[bold red]Error startup:[/] {e}")
         sys.exit(1)
+
