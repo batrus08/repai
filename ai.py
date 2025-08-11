@@ -8,11 +8,18 @@ from typing import List, Optional, Tuple
 class ZeroShotClient:
     """Client sederhana untuk Hugging Face zero-shot classification API."""
 
-    def __init__(self, model: str, timeout_ms: int = 4000, min_delay: float = 1.0):
+    def __init__(
+        self,
+        model: str,
+        timeout_ms: int = 4000,
+        min_delay: float = 1.0,
+        hypothesis_template: str = "Teks ini menunjukkan bahwa {}.",
+    ):
         self.model = model
         self.timeout = timeout_ms / 1000
         self.min_delay = min_delay
         self._last_call = 0.0
+        self.hypothesis_template = hypothesis_template
 
     async def _throttle(self) -> None:
         """Pastikan ada jeda minimum antar panggilan API."""
@@ -21,10 +28,13 @@ class ZeroShotClient:
             await asyncio.sleep(self.min_delay - delta)
         self._last_call = time.time()
 
-    async def classify(self, text: str, candidate_labels: List[str]) -> Optional[Tuple[str, float]]:
+    async def classify(
+        self, text: str, candidate_labels: List[str]
+    ) -> Optional[Tuple[str, float, float]]:
         """
         Klasifikasikan *text* terhadap *candidate_labels*.
-        Mengembalikan tuple (label, confidence) atau None jika gagal.
+        Mengembalikan tuple (label, top1, top2) atau None jika gagal.
+        top1 = confidence label teratas, top2 = skor label kedua.
         """
         await self._throttle()
         token = os.environ.get("HF_API_TOKEN")
@@ -34,7 +44,10 @@ class ZeroShotClient:
         headers = {"Authorization": f"Bearer {token}"}
         payload = {
             "inputs": text,
-            "parameters": {"candidate_labels": candidate_labels},
+            "parameters": {
+                "candidate_labels": candidate_labels,
+                "hypothesis_template": self.hypothesis_template,
+            },
         }
         url = f"https://api-inference.huggingface.co/models/{self.model}"
         loop = asyncio.get_running_loop()
@@ -51,7 +64,9 @@ class ZeroShotClient:
             labels = data.get("labels")
             scores = data.get("scores")
             if labels and scores:
-                return labels[0], scores[0]
+                top1 = scores[0]
+                top2 = scores[1] if len(scores) > 1 else 0.0
+                return labels[0], top1, top2
         except Exception as e:
             logging.warning(f"ZeroShot classify error: {e}")
             return None
