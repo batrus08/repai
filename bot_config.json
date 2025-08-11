@@ -104,8 +104,12 @@
   "reply_message": "🔒 Privat (Bisa email cust)\n- 1 Hari: 7K\n- 3 Hari: 15K\n- 7 Hari: 24K\n- 1 Bulan: 29K \n\n✨Sharing\n- 1 Hari: 5K\n- 3 Hari: 10K\n- 7 Hari: 18K\n- 1 Bulan: 23K\n\n📌Bayar Bisa Diakhir📌Bergaransi\n\n📞https://tinyurl.com/wameowww",
   "ai_enabled": true,
   "ai_model": "joeddav/xlm-roberta-large-xnli",
-  "ai_candidate_labels": ["pembeli", "penjual", "lainnya"],
-  "ai_threshold": 0.8,
+  "ai_candidate_labels": [
+    "penjual : penulis menawarkan barang/jasa/sewa; kata kunci jual/WTS/open PO/ready stok/harga/tersedia/minat DM.",
+    "pembeli : penulis mencari atau membutuhkan barang/jasa; kata kunci butuh/need/cari/WTB/looking for/request.",
+    "lainnya : bukan niat jual/beli; diskusi/berita/humor/info umum/promosi non-transaksional."
+  ],
+  "ai_threshold": 0.55,
   "ai_timeout_ms": 4000,
   "pre_filter_keywords": true,
   "log_predictions": true,

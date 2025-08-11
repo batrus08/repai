@@ -22,7 +22,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from urllib.parse import quote
 
@@ -74,6 +74,23 @@ DEFAULT_DASHBOARD = {
 
 # Default search URL akan dibangun ulang dari config
 SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
+
+AI_CACHE_TTL_MS = 86_400_000  # 24 jam
+AI_CACHE: Dict[str, Tuple[str, float, float, int]] = {}
+
+PREFIX_KONTEKS = (
+    "TUGAS: Klasifikasikan niat jual-beli dari sebuah tweet pengguna Indonesia/Inggris campuran.\n"
+    "JANGAN mengandalkan hashtag saja; fokus pada niat penulis.\n"
+    "Definisi label:\n"
+    "• penjual = penulis MENAWARKAN barang/jasa/sewa; ciri: \"jual\", \"WTS\", \"open PO\", \"ready stok\", \"harga\", \"tersedia slot\", \"sewa\", \"minat DM\".\n"
+    "• pembeli = penulis MENCARI/MEMBUTUHKAN barang/jasa; ciri: \"butuh\", \"need\", \"cari\", \"WTB\", \"looking for\", \"request\".\n"
+    "• lainnya = bukan niat jual/beli (diskusi, berita, humor, info umum, promosi non-transaksional).\n"
+    "Aturan tie-break:\n"
+    "• Jika ada tanda menawarkan + harga/ketersediaan → penjual.\n"
+    "• Jika ada kata butuh/cari/WTB/need tanpa penawaran → pembeli.\n"
+    "• Jika ambigu, pilih label paling sesuai NIAT penulis, bukan konteks orang lain.\n"
+    "HASIL: Beri satu label terbaik dan skor keyakinan 0–1."
+)
 
 
 def load_json(path: str) -> Optional[Any]:
@@ -495,8 +512,16 @@ async def run() -> None:
 
     ai_enabled = cfg.get("ai_enabled", False)
     ai_model = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
-    ai_labels = cfg.get("ai_candidate_labels", ["pembeli", "penjual", "lainnya"])
-    ai_threshold = cfg.get("ai_threshold", 0.8)
+    ai_labels = cfg.get(
+        "ai_candidate_labels",
+        [
+            "penjual : penulis menawarkan barang/jasa/sewa; kata kunci jual/WTS/open PO/ready stok/harga/tersedia/minat DM.",
+            "pembeli : penulis mencari atau membutuhkan barang/jasa; kata kunci butuh/need/cari/WTB/looking for/request.",
+            "lainnya : bukan niat jual/beli; diskusi/berita/humor/info umum/promosi non-transaksional.",
+        ],
+    )
+    ai_threshold = cfg.get("ai_threshold", 0.55)
+    ai_margin = cfg.get("ai_margin", 0.10)
     ai_timeout = cfg.get("ai_timeout_ms", 4000)
     pre_filter = cfg.get("pre_filter_keywords", True)
     log_preds = cfg.get("log_predictions", True)
@@ -574,20 +599,29 @@ async def run() -> None:
                             continue
                         label = "pembeli"
                         conf = 1.0
+                        second = 0.0
                         if ai_enabled and ai_client:
-                            res = await ai_client.classify(norm_text, ai_labels)
-                            if res is None:
-                                stats["ai_disabled"] = stats.get("ai_disabled", 0) + 1
-                                logging.warning("AI classification unavailable; proceeding without filter")
+                            cache_key = norm_text
+                            now_ms = int(time.time() * 1000)
+                            cached = AI_CACHE.get(cache_key)
+                            if cached and now_ms - cached[3] < AI_CACHE_TTL_MS:
+                                label, conf, second, _ = cached
                             else:
-                                label, conf = res
-                                if label != "pembeli" or conf < ai_threshold:
-                                    stats["ai_amb"] = stats.get("ai_amb", 0) + 1
-                                    record_decision(cand, ReplyResult("skip", "ai_amb"))
-                                    activity.append(f"@{cand.author} skip: ai_amb")
-                                    if len(activity) > 10:
-                                        activity.pop(0)
-                                    continue
+                                input_text = f"{PREFIX_KONTEKS}\nTweet: {cand.text}"
+                                res = await ai_client.classify(input_text, ai_labels)
+                                if res is None:
+                                    stats["ai_disabled"] = stats.get("ai_disabled", 0) + 1
+                                    logging.warning("AI classification unavailable; proceeding without filter")
+                                else:
+                                    label, conf, second = res
+                                    AI_CACHE[cache_key] = (label, conf, second, now_ms)
+                            if label != "pembeli" or conf < ai_threshold or (conf - second) < ai_margin:
+                                stats["ai_amb"] = stats.get("ai_amb", 0) + 1
+                                record_decision(cand, ReplyResult("skip", "ai_amb"))
+                                activity.append(f"@{cand.author} skip: ai_amb")
+                                if len(activity) > 10:
+                                    activity.pop(0)
+                                continue
 
                         res = await attempt_reply(page, cand, reply_msg, reply_cfg, state, replied, stats, timers)
                         record_decision(cand, res)
