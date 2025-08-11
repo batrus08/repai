@@ -28,11 +28,12 @@ from urllib.parse import quote
 from playwright.async_api import TimeoutError, async_playwright
 
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.spinner import Spinner
 
 from ai import ZeroShotClient
 
@@ -196,20 +197,29 @@ class ReplyResult:
 # ----------------- Login & navigasi -----------------
 
 
-async def ensure_logged_in(page) -> bool:
-    """Pastikan sesi login aktif. Kembalikan True jika sudah login."""
+async def wait_until_logged_in(page, max_ms: int) -> bool:
+    """Menunggu hingga ikon profil muncul yang menandakan login sukses."""
     try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=5000)
-        return True
-    except TimeoutError:
-        pass
-    await page.goto("https://x.com/login")
-    try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=120000)
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=max_ms)
         await page.context.storage_state(path=COOKIE_FILE)
         return True
     except TimeoutError:
         return False
+
+
+async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
+    """Pastikan sesi login aktif dan halaman hasil pencarian siap."""
+    try:
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=3000)
+        return True
+    except TimeoutError:
+        pass
+
+    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    if await wait_until_logged_in(page, 120000):
+        await resilient_goto(page, search_url, net_cfg, stats)
+        return True
+    return False
 
 
 async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
@@ -238,6 +248,7 @@ async def soft_scan_cycle(
     candidates: List[Candidate] = []
     arts = await page.query_selector_all("article")
     stats["found"] = stats.get("found", 0) + len(arts)
+    stats["found_last"] = len(arts)
 
     for art in arts:
         link = await art.query_selector("a[href*='/status/']")
@@ -405,19 +416,17 @@ def render_dashboard(
     last = status.get("last_activity")
     if last:
         user, ts = last
-        lines.append(f"Aktivitas Terakhir: @{user} {ts.strftime('%H:%M:%S')}")
+        lines.append(f"Aktivitas Terakhir: @{user} • {ts.strftime('%H:%M:%S')}")
     else:
         lines.append("Aktivitas Terakhir: -")
     if status.get("url"):
         login = "OK" if status.get("logged_in") else "LOGIN"
-        lines.append(f"URL: {status['url']} ({login})")
+        cdur = status.get("cycle_dur", 0) / 1000
+        lines.append(f"URL Aktif: {status['url']} • {login} • {cdur:.1f}s")
 
-    # tampilkan rata-rata durasi
-    if timers.get("scan_cycle"):
-        avg = sum(timers["scan_cycle"]) / len(timers["scan_cycle"])
-        lines.append(f"Rata scan: {avg:.0f} ms")
-
-    return Panel(Text("\n".join(lines)), title=None, subtitle_align="left", renderable=table, padding=0)
+    summary = Text("\n".join(lines))
+    grp = Group(status.get("spinner", Text("")), table, summary)
+    return Panel(grp, padding=0)
 
 
 async def key_listener(state: Dict[str, Any]) -> None:
@@ -474,8 +483,19 @@ async def run() -> None:
     )
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
-    await ensure_logged_in(page)
+    # buka halaman login dan tunggu sampai benar-benar masuk
+    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    login_spinner = Spinner("dots", text="Menunggu login…")
+    with Live(login_spinner, console=console, refresh_per_second=10):
+        logged = await wait_until_logged_in(page, 120000)
+    if not logged:
+        console.print("[bold red]Gagal login.[/]")
+        await browser.close()
+        await pw.stop()
+        return
+
     await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+    work_spinner = Spinner("line")
 
     if cfg["dashboard"].get("interactive_keys", True):
         asyncio.create_task(key_listener(state))
@@ -486,9 +506,15 @@ async def run() -> None:
     with Live(console=console, refresh_per_second=4, screen=True) as live:
         while not state["quit"]:
             start = time.perf_counter()
-            logged_in = await ensure_logged_in(page)
+            logged_in = await ensure_logged_in(page, SEARCH_URL, net_cfg, stats)
             if not logged_in:
+                await asyncio.sleep(1)
+                continue
+            try:
+                await page.wait_for_selector("article", timeout=net_cfg["timeout_ms"])
+            except TimeoutError:
                 await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+                continue
             refreshed = False
 
             new_candidates: List[Candidate] = []
@@ -542,11 +568,13 @@ async def run() -> None:
                 "url": SEARCH_URL,
                 "logged_in": logged_in,
                 "ai_enabled": ai_enabled,
+                "cycle_dur": dur,
+                "spinner": work_spinner,
             }
             live.update(render_dashboard(stats, timers, status))
 
             cycle += 1
-            record_cycle(cycle, len(new_candidates), len(new_candidates), dur, refreshed)
+            record_cycle(cycle, stats.get("found_last", 0), len(new_candidates), dur, refreshed)
 
             await asyncio.sleep(scan_cfg["scan_interval_ms"] / 1000)
 
