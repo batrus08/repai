@@ -28,13 +28,15 @@ yang layak dibalas.
 2. **Konfigurasi**
 
    Sunting `bot_config.json` sesuai kebutuhan. Untuk mengaktifkan
-   klasifikasi AI, sediakan token Hugging Face melalui file `tokens.json`
-   **atau** set variabel lingkungan `HF_API_TOKEN` sebelum menjalankan bot.
+   klasifikasi AI, jalankan bot lalu masukkan token Hugging Face ketika
+   diminta. Token akan tersimpan otomatis ke `tokens.json`. Sebagai
+   alternatif, Anda bisa menyiapkan variabel lingkungan `HF_API_TOKEN`
+   sebelum menjalankan bot.
 
 ## Menjalankan Bot
 
 ```bash
-# memakai tokens.json
+# menjalankan dan memasukkan token saat diminta
 python twt.py
 
 # atau langsung lewat variabel lingkungan

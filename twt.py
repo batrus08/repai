@@ -123,6 +123,26 @@ def load_hf_token(path: str = "tokens.json") -> Optional[str]:
     return None
 
 
+def save_hf_token(token: str, path: str = "tokens.json") -> None:
+    """Persist Hugging Face token atomically to disk."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"hf_api_token": token}, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def ensure_hf_token() -> str:
+    """Ensure HF_API_TOKEN exists by prompting user if needed."""
+    token = os.environ.get("HF_API_TOKEN") or load_hf_token()
+    while not token:
+        token = input("Masukkan Hugging Face API token: ").strip()
+    save_hf_token(token)
+    os.environ["HF_API_TOKEN"] = token
+    return token
+
+
 def load_replied() -> List[int]:
     data = load_json(REPLIED_LOG)
     return data if isinstance(data, list) else []
@@ -464,12 +484,7 @@ async def run() -> None:
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
 
-    if not os.environ.get("HF_API_TOKEN"):
-        token = load_hf_token()
-        if token:
-            os.environ["HF_API_TOKEN"] = token
-        else:
-            logging.warning("HF API token tidak ditemukan; klasifikasi AI mungkin gagal")
+    ensure_hf_token()
 
     pos_kws = cfg.get("positive_keywords", [])
     neg_kws = cfg.get("negative_keywords", [])
