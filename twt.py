@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from playwright.async_api import async_playwright, TimeoutError
 import psutil, pyfiglet
+from urllib.parse import quote  # for URL encoding
 
 from rich import box
 from rich.console import Console, Group
@@ -17,7 +18,6 @@ from rich.text import Text
 from ai import ZeroShotClient
 
 # ---- KONFIGURASI ----
-# URL pencarian kini diatur lewat `search_config` pada bot_config.json
 CONFIG_PATH  = "bot_config.json"
 TOKEN_PATH   = "tokens.json"
 REPLIED_LOG  = "replied_ids.json"
@@ -25,6 +25,9 @@ SESSION_DIR  = "bot_session"
 COOKIE_FILE  = "session.json"
 MAX_AGE_HRS  = 3    # hanya balas tweet ≤ 3 jam
 LOOP_SEC     = 15   # jeda antar loop (detik)
+
+# Default search URL example (will be rebuilt from config)
+SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
 
 console = Console()
 
@@ -45,23 +48,16 @@ def load_config():
 
 
 def build_search_url(cfg: dict) -> str:
-    """Bangun URL pencarian X dari konfigurasi.
-    Mudah ubah keyword/hashtag via bot_config.json."""
-    default = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
-    sc = cfg.get("search_config")
-    if not isinstance(sc, dict):
-        return default
+    """Bentuk URL pencarian X berdasarkan konfigurasi."""
+    sc = cfg.get("search_config") or {}
 
-    keyword = sc.get("keyword")
-    hashtag = sc.get("hashtag")
+    keyword = sc.get("keyword", "chatgpt")
+    hashtag = sc.get("hashtag", "zonauang")
     src = sc.get("src", "recent_search_click")
     live = sc.get("live", True)
 
-    if not keyword or not hashtag:
-        return default
-
-    query = f"{keyword} #{hashtag}".replace(" ", "%20").replace("#", "%23")
-    url = f"https://x.com/search?q={query}&src={src}"
+    query = quote(f"{keyword} #{hashtag}")  # encode spasi dan tanda '#'
+    url = f"https://x.com/search?q={query}&src={quote(src)}"
     if live:
         url += "&f=live"
     return url
@@ -235,11 +231,12 @@ def build_layout(stats, timer, offset) -> Layout:
     return layout
 
 async def run():
-    cfg        = load_config()
-    search_url = build_search_url(cfg)  # mudah ganti kata kunci/hashtag
-    pos_kws    = cfg.get("positive_keywords", [])
-    neg_kws    = cfg.get("negative_keywords", [])
-    reply      = cfg.get("reply_message", "")
+    cfg = load_config()
+    global SEARCH_URL
+    SEARCH_URL = build_search_url(cfg)  # bangun URL pencarian dari config
+    pos_kws = cfg.get("positive_keywords", [])
+    neg_kws = cfg.get("negative_keywords", [])
+    reply   = cfg.get("reply_message", "")
 
     ai_enabled   = cfg.get("ai_enabled", False)
     ai_model     = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
@@ -279,7 +276,7 @@ async def run():
         offset = 0
         while True:
             try:
-                await page.goto(search_url, wait_until="domcontentloaded")
+                await page.goto(SEARCH_URL, wait_until="domcontentloaded")
                 await detect_captcha(page)
                 await asyncio.sleep(1)
 
