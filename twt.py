@@ -421,6 +421,7 @@ def render_dashboard(
     stats: Dict[str, int],
     timers: Dict[str, List[int]],
     status: Dict[str, Any],
+    activity: List[str],
 ) -> Panel:
     table = Table(box=box.SIMPLE_HEAVY, expand=True)
     headers = [
@@ -457,7 +458,12 @@ def render_dashboard(
         lines.append(f"URL Aktif: {status['url']} • {login} • {cdur:.1f}s")
 
     summary = Text("\n".join(lines))
-    grp = Group(status.get("spinner", Text("")), table, summary)
+
+    log_lines = activity[-5:]
+    log_text = Text("\n".join(log_lines) if log_lines else "-")
+    log_panel = Panel(log_text, title="Log Aktivitas", padding=(0, 1))
+
+    grp = Group(status.get("spinner", Text("")), table, summary, log_panel)
     return Panel(grp, padding=0)
 
 
@@ -510,6 +516,7 @@ async def run() -> None:
     timers: Dict[str, List[int]] = {"scan_cycle": []}
     state = {"paused": False, "force_refresh": False, "dry_run": reply_cfg.get("dry_run", False), "quit": False}
     last_activity: Optional[tuple[str, datetime]] = None
+    activity: List[str] = []
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch_persistent_context(
@@ -560,6 +567,10 @@ async def run() -> None:
                         norm_text = normalize_text(cand.text)
                         if pre_filter and not passes_prefilter(norm_text, pos_kws, neg_kws):
                             stats["skip_kata"] = stats.get("skip_kata", 0) + 1
+                            record_decision(cand, ReplyResult("skip", "prefilter"))
+                            activity.append(f"@{cand.author} skip: kata")
+                            if len(activity) > 10:
+                                activity.pop(0)
                             continue
                         label = "pembeli"
                         conf = 1.0
@@ -572,10 +583,17 @@ async def run() -> None:
                                 label, conf = res
                                 if label != "pembeli" or conf < ai_threshold:
                                     stats["ai_amb"] = stats.get("ai_amb", 0) + 1
+                                    record_decision(cand, ReplyResult("skip", "ai_amb"))
+                                    activity.append(f"@{cand.author} skip: ai_amb")
+                                    if len(activity) > 10:
+                                        activity.pop(0)
                                     continue
 
                         res = await attempt_reply(page, cand, reply_msg, reply_cfg, state, replied, stats, timers)
                         record_decision(cand, res)
+                        activity.append(f"@{cand.author} {res.action}: {res.reason}")
+                        if len(activity) > 10:
+                            activity.pop(0)
                         if res.action == "reply":
                             last_activity = (cand.author, datetime.now())
                     new_candidates = cands
@@ -606,7 +624,7 @@ async def run() -> None:
                 "cycle_dur": dur,
                 "spinner": work_spinner,
             }
-            live.update(render_dashboard(stats, timers, status))
+            live.update(render_dashboard(stats, timers, status, activity))
 
             cycle += 1
             record_cycle(cycle, stats.get("found_last", 0), len(new_candidates), dur, refreshed)

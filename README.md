@@ -11,6 +11,7 @@ yang layak dibalas.
 - Prefilter kata positif/negatif yang didefinisikan pada `bot_config.json`.
 - Dukungan klasifikasi *zero-shot* melalui Hugging Face (token dibaca dari `tokens.json` atau variabel lingkungan `HF_API_TOKEN`; hanya diperlukan jika `ai_enabled=true`).
 - Menampilkan statistik proses dan penggunaan sistem.
+- Log aktivitas menampilkan tweet yang dibalas atau dilewati beserta alasannya.
 - Penanganan CAPTCHA secara manual.
 
 ## Persiapan
