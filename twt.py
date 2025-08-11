@@ -73,16 +73,30 @@ async def wait_for_manual_captcha():
     console.print("[bold yellow]⚠️ CAPTCHA terdeteksi![/] Selesaikan di browser lalu tekan Enter…")
     await asyncio.to_thread(input)
 
-async def detect_captcha(page):
+async def detect_captcha(page, stats=None):
     u = page.url.lower()
     if "captcha" in u or "challenge" in u:
+        if stats is not None:
+            stats["captcha"] += 1
         await wait_for_manual_captcha()
     else:
         try:
             if await page.query_selector("iframe[src*='captcha']"):
+                if stats is not None:
+                    stats["captcha"] += 1
                 await wait_for_manual_captcha()
         except TimeoutError:
             pass
+
+async def detect_rate_limit(page, stats=None):
+    try:
+        if await page.query_selector("text='Rate limit exceeded'"):
+            if stats is not None:
+                stats["rate"] += 1
+            return True
+    except TimeoutError:
+        pass
+    return False
 
 def render_banner() -> Text:
     art = pyfiglet.figlet_format("Meowlie Bot", font="slant")
@@ -90,7 +104,7 @@ def render_banner() -> Text:
     centered = "\n".join(line.center(width) for line in art.splitlines())
     return Text(centered, style="bold green")
 
-def render_summary(stats) -> Table:
+def render_summary(stats, last_activity) -> Group:
     table = Table(
         expand=True,
         box=box.SIMPLE_HEAVY,
@@ -99,22 +113,30 @@ def render_summary(stats) -> Table:
         show_lines=False
     )
     cols = [
-        ("🔍 Dipindai",   stats["scanned"]),
-        ("🎯 Kandidat",   stats["cand"]),
-        ("✅ Terbalas",   stats["replied"]),
-        ("⏰ Lewat Usia", stats["age"]),
-        ("🪤 Prefilter",  stats["kw"]),
-        ("🤖 AI Call",    stats["ai_calls"]),
-        ("🚫 AI Skip",    stats["ai_skip"]),
-        ("⁉️ Ambigu",     stats["ai_amb"]),
-        ("💥 AI Err",     stats["ai_err"]),
-        ("🚫 Skip Btn",   stats["btn"]),
-        ("✋ Skip Dis",    stats["dis"]),
+        ("🔍 Ditemukan", stats["scanned"]),
+        ("🎯 Calon Balas", stats["cand"]),
+        ("✅ Sudah Balas", stats["replied"]),
+        ("🪤 Skip Kata", stats["kw"]),
+        ("🚫 Skip Tombol", stats["btn"]),
     ]
     for header, _ in cols:
         table.add_column(header, justify="center")
     table.add_row(*(str(v) for _, v in cols))
-    return table
+
+    lines = [f"Terlalu Lama: {stats['age']}"]
+    if last_activity:
+        user, ts = last_activity
+        lines.append(f"Aktivitas terakhir: @{user} - {ts.strftime('%H:%M:%S')}")
+    else:
+        lines.append("Aktivitas terakhir: -")
+    if stats.get("captcha"):
+        lines.append(f"Captcha: {stats['captcha']}")
+    if stats.get("rate"):
+        lines.append(f"Rate-limit: {stats['rate']}")
+    if stats.get("ai_err"):
+        lines.append(f"AI error: {stats['ai_err']}")
+
+    return Group(table, Text("\n".join(lines), style="dim"))
 
 def render_system() -> Table:
     cpu = psutil.cpu_percent(interval=None)
@@ -174,7 +196,7 @@ def log_ai_decision(tid, label, conf, prefilter_pass, reason, text, path="ai_dec
     except Exception:
         pass
 
-def build_layout(stats, timer, offset) -> Layout:
+def build_layout(stats, timer, offset, last_activity) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=7),
@@ -202,7 +224,7 @@ def build_layout(stats, timer, offset) -> Layout:
     )
 
     # BODY
-    summary_pan = Panel(render_summary(stats),
+    summary_pan = Panel(render_summary(stats, last_activity),
                         title="🐾 Summary",
                         border_style="cyan",
                         padding=(1,1))
@@ -247,7 +269,8 @@ async def run():
 
     replied = load_replied()
     last_id = 0
-    stats   = {k:0 for k in ("scanned","cand","replied","age","kw","btn","dis","ai_calls","ai_skip","ai_amb","ai_err")}
+    last_activity = None
+    stats   = {k:0 for k in ("scanned","cand","replied","age","kw","btn","ai_calls","ai_skip","ai_amb","ai_err","captcha","rate")}
 
     pw = await async_playwright().start()
     browser = await pw.chromium.launch_persistent_context(
@@ -260,37 +283,52 @@ async def run():
     if not os.path.exists(COOKIE_FILE):
         console.print("[green]🔐 Silakan login ke X…[/]")
         await page.goto("https://x.com/login")
-        await asyncio.sleep(120)
-        await page.context.storage_state(path=COOKIE_FILE)
+        try:
+            await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=120000)
+            await page.context.storage_state(path=COOKIE_FILE)
+        except TimeoutError:
+            console.print("[red]Gagal memverifikasi login.[/]")
+    else:
+        await page.goto("https://x.com/home")
+        try:
+            await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=15000)
+        except TimeoutError:
+            console.print("[red]⚠️ Verifikasi login gagal.[/]")
 
-    layout = build_layout(stats, LOOP_SEC, offset=0)
+    await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    await detect_captcha(page, stats)
+    await detect_rate_limit(page, stats)
+    await asyncio.sleep(1)
+
+    layout = build_layout(stats, LOOP_SEC, offset=0, last_activity=last_activity)
     with Live(layout, console=console, screen=True, refresh_per_second=10) as live:
         offset = 0
         while True:
             try:
-                await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-                await detect_captcha(page)
-                await asyncio.sleep(1)
-
                 arts = await page.query_selector_all("article")
                 stats["scanned"] += len(arts)
 
                 items = []
                 for art in arts:
                     link = await art.query_selector("a[href*='/status/']")
-                    if not link: continue
-                    tid = int((await link.get_attribute("href")).split("/")[-1])
-                    if tid <= last_id or tid in replied: continue
+                    if not link:
+                        continue
+                    href = await link.get_attribute("href")
+                    tid = int(href.split("/")[-1])
+                    user = href.split("/")[1]
+                    if tid <= last_id or tid in replied:
+                        continue
                     tm = await art.query_selector("time")
-                    if not tm: continue
+                    if not tm:
+                        continue
                     ts = await tm.get_attribute("datetime")
                     ttime = datetime.fromisoformat(ts.replace("Z","+00:00"))
-                    items.append((ttime,tid,art))
+                    items.append((ttime, tid, art, user))
 
                 items.sort(key=lambda x: x[0], reverse=True)
                 stats["cand"] += len(items)
 
-                for ttime, tid, art in items:
+                for ttime, tid, art, user in items:
                     last_id = max(last_id, tid)
                     if datetime.now(timezone.utc) - ttime > timedelta(hours=MAX_AGE_HRS):
                         stats["age"] += 1
@@ -310,11 +348,9 @@ async def run():
                         continue
 
                     btn = await art.query_selector("[data-testid='reply']")
-                    if not btn:
+                    if not btn or await btn.get_attribute("aria-disabled") == "true":
                         stats["btn"] += 1
-                        continue
-                    if await btn.get_attribute("aria-disabled") == "true":
-                        stats["dis"] += 1
+                        console.log(f"Skip Tombol: {tid}")
                         continue
 
                     label = None
@@ -367,7 +403,8 @@ async def run():
                         continue
 
                     await btn.click()
-                    await detect_captcha(page)
+                    await detect_captcha(page, stats)
+                    await detect_rate_limit(page, stats)
                     try:
                         await page.wait_for_selector("div[role='textbox']", timeout=5000)
                     except TimeoutError:
@@ -377,6 +414,7 @@ async def run():
                     await page.click("[data-testid='tweetButton']")
                     replied.append(tid); save_replied(replied)
                     stats["replied"] += 1
+                    last_activity = (user, datetime.now())
                     if log_preds:
                         log_ai_decision(tid, label, conf, True, "balas_ok", norm_text)
 
@@ -385,13 +423,18 @@ async def run():
                 break
 
             for rem in range(LOOP_SEC, 0, -1):
-                layout = build_layout(stats, rem, offset)
+                layout = build_layout(stats, rem, offset, last_activity)
                 live.update(layout)
                 await asyncio.sleep(1)
                 offset += 1
 
-        await browser.close()
-        await pw.stop()
+            await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+            await detect_captcha(page, stats)
+            await detect_rate_limit(page, stats)
+            await asyncio.sleep(1)
+
+    await browser.close()
+    await pw.stop()
 
 if __name__ == "__main__":
     try:
