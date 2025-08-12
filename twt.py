@@ -36,7 +36,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.spinner import Spinner
 
-from ai import ZeroShotClient
+from ai import classify_text
 
 console = Console()
 
@@ -76,21 +76,9 @@ DEFAULT_DASHBOARD = {
 SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
 
 AI_CACHE_TTL_MS = 86_400_000  # 24 jam
-AI_CACHE: Dict[str, Tuple[str, float, float, int]] = {}
+AI_CACHE: Dict[str, Tuple[str, int]] = {}
 
-PREFIX_KONTEKS = (
-    "TUGAS: Klasifikasikan niat jual-beli dari sebuah tweet pengguna Indonesia/Inggris campuran.\n"
-    "JANGAN mengandalkan hashtag saja; fokus pada niat penulis.\n"
-    "Definisi label:\n"
-    "• penjual = penulis MENAWARKAN barang/jasa/sewa; ciri: \"jual\", \"WTS\", \"open PO\", \"ready stok\", \"harga\", \"tersedia slot\", \"sewa\", \"minat DM\".\n"
-    "• pembeli = penulis MENCARI/MEMBUTUHKAN barang/jasa; ciri: \"butuh\", \"need\", \"cari\", \"WTB\", \"looking for\", \"request\".\n"
-    "• lainnya = bukan niat jual/beli (diskusi, berita, humor, info umum, promosi non-transaksional).\n"
-    "Aturan tie-break:\n"
-    "• Jika ada tanda menawarkan + harga/ketersediaan → penjual.\n"
-    "• Jika ada kata butuh/cari/WTB/need tanpa penawaran → pembeli.\n"
-    "• Jika ambigu, pilih label paling sesuai NIAT penulis, bukan konteks orang lain.\n"
-    "HASIL: Beri satu label terbaik dan skor keyakinan 0–1."
-)
+
 
 
 def load_json(path: str) -> Optional[Any]:
@@ -128,39 +116,6 @@ def build_search_url(cfg: Dict[str, Any]) -> str:
     if live:
         url += "&f=live"
     return url
-
-
-def load_hf_token(path: str = "tokens.json") -> Optional[str]:
-    """Load Hugging Face API token from JSON file."""
-    data = load_json(path)
-    if isinstance(data, dict):
-        token = data.get("hf_api_token")
-        if isinstance(token, str) and token.strip():
-            return token.strip()
-    return None
-
-
-def save_hf_token(token: str, path: str = "tokens.json") -> None:
-    """Persist Hugging Face token atomically to disk."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"hf_api_token": token}, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-async def ensure_hf_token() -> str:
-    """Ensure HF_API_TOKEN exists by prompting user if needed without blocking the event loop."""
-    token = os.environ.get("HF_API_TOKEN") or load_hf_token()
-    while not token:
-        # Use a thread to avoid blocking asyncio event loop
-        token = (
-            await asyncio.to_thread(input, "Masukkan Hugging Face API token: ")
-        ).strip()
-    save_hf_token(token)
-    os.environ["HF_API_TOKEN"] = token
-    return token
 
 
 def load_replied() -> List[int]:
@@ -512,29 +467,12 @@ async def run() -> None:
     reply_msg = cfg.get("reply_message", "")
 
     ai_enabled = cfg.get("ai_enabled", False)
-    ai_model = cfg.get("ai_model", "joeddav/xlm-roberta-large-xnli")
-    ai_labels = cfg.get(
-        "ai_candidate_labels",
-        [
-            "penjual : penulis menawarkan barang/jasa/sewa; kata kunci jual/WTS/open PO/ready stok/harga/tersedia/minat DM.",
-            "pembeli : penulis mencari atau membutuhkan barang/jasa; kata kunci butuh/need/cari/WTB/looking for/request.",
-            "lainnya : bukan niat jual/beli; diskusi/berita/humor/info umum/promosi non-transaksional.",
-        ],
-    )
-    ai_threshold = cfg.get("ai_threshold", 0.55)
-    ai_margin = cfg.get("ai_margin", 0.10)
     ai_timeout = cfg.get("ai_timeout_ms", 4000)
     pre_filter = cfg.get("pre_filter_keywords", True)
-    log_preds = cfg.get("log_predictions", True)
-
-    if ai_enabled:
-        await ensure_hf_token()
 
     scan_cfg = cfg["scan"]
     net_cfg = cfg["network"]
     reply_cfg = cfg["reply"]
-
-    ai_client = ZeroShotClient(ai_model, timeout_ms=ai_timeout) if ai_enabled else None
 
     replied = set(load_replied())
     seen_ids: set[int] = set()
@@ -599,24 +537,23 @@ async def run() -> None:
                                 activity.pop(0)
                             continue
                         label = "pembeli"
-                        conf = 1.0
-                        second = 0.0
-                        if ai_enabled and ai_client:
+                        if ai_enabled:
                             cache_key = norm_text
                             now_ms = int(time.time() * 1000)
                             cached = AI_CACHE.get(cache_key)
-                            if cached and now_ms - cached[3] < AI_CACHE_TTL_MS:
-                                label, conf, second, _ = cached
+                            if cached and now_ms - cached[1] < AI_CACHE_TTL_MS:
+                                label = cached[0]
                             else:
-                                input_text = f"{PREFIX_KONTEKS}\nTweet: {cand.text}"
-                                res = await ai_client.classify(input_text, ai_labels)
+                                res = await classify_text(cand.text, timeout_ms=ai_timeout)
                                 if res is None:
                                     stats["ai_disabled"] = stats.get("ai_disabled", 0) + 1
-                                    logging.warning("AI classification unavailable; proceeding without filter")
+                                    logging.warning(
+                                        "AI classification unavailable; proceeding without filter"
+                                    )
                                 else:
-                                    label, conf, second = res
-                                    AI_CACHE[cache_key] = (label, conf, second, now_ms)
-                            if label != "pembeli" or conf < ai_threshold or (conf - second) < ai_margin:
+                                    label = res
+                                    AI_CACHE[cache_key] = (label, now_ms)
+                            if label != "pembeli":
                                 stats["ai_amb"] = stats.get("ai_amb", 0) + 1
                                 record_decision(cand, ReplyResult("skip", "ai_amb"))
                                 activity.append(f"@{cand.author} skip: ai_amb")

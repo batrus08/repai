@@ -2,14 +2,14 @@
 
 Bot sederhana untuk memindai pencarian di X (Twitter) dan membalas secara otomatis.
 `twt.py` menjalankan browser Playwright, menerapkan filter kata kunci, serta
-opsional memanfaatkan model *zero-shot* dari Hugging Face untuk memilah tweet
-yang layak dibalas.
+opsional memanfaatkan OpenAI Chat Completions API untuk memilah tweet yang layak
+dibalas.
 
 ## Fitur
 
 - Memindai tweet terbaru sesuai kata kunci pencarian.
 - Prefilter kata positif/negatif yang didefinisikan pada `bot_config.json`.
-- Dukungan klasifikasi *zero-shot* melalui Hugging Face (token dibaca dari `tokens.json` atau variabel lingkungan `HF_API_TOKEN`; hanya diperlukan jika `ai_enabled=true`).
+- Dukungan klasifikasi niat jual/beli melalui OpenAI (model dari variabel lingkungan `OPENAI_MODEL`, default `gpt-5-nano`; hanya diperlukan jika `ai_enabled=true`).
 - Menampilkan statistik proses dan penggunaan sistem.
 - Log aktivitas menampilkan tweet yang dibalas atau dilewati beserta alasannya.
 - Penanganan CAPTCHA secara manual.
@@ -28,20 +28,19 @@ yang layak dibalas.
 
 2. **Konfigurasi**
 
-   Sunting `bot_config.json` sesuai kebutuhan. Jika `ai_enabled=true`,
-   jalankan bot lalu masukkan token Hugging Face ketika diminta. Token
-   akan tersimpan otomatis ke `tokens.json`. Sebagai alternatif, Anda bisa
-   menyiapkan variabel lingkungan `HF_API_TOKEN` sebelum menjalankan bot.
-   Bila `ai_enabled=false`, token tidak diperlukan.
+    Sunting `bot_config.json` sesuai kebutuhan. Jika `ai_enabled=true`,
+    siapkan variabel lingkungan `OPENAI_API_KEY` (bisa lewat file `.env`).
+    Nama model dapat diatur melalui `OPENAI_MODEL` atau gunakan bawaan
+    `gpt-5-nano`.
 
 ## Menjalankan Bot
 
 ```bash
-# menjalankan bot; token hanya diminta bila `ai_enabled=true`
+# menjalankan bot; `OPENAI_API_KEY` harus tersedia bila `ai_enabled=true`
 python twt.py
 
 # atau langsung lewat variabel lingkungan
-HF_API_TOKEN=hf_xxx python twt.py
+OPENAI_API_KEY=sk-xxx python twt.py
 ```
 
 Bot akan membuka jendela browser dan mulai memindai tweet. Hentikan dengan
