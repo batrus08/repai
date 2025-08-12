@@ -2,7 +2,7 @@
 
 Bot sederhana untuk memindai pencarian di X (Twitter) dan membalas secara otomatis.
 `twt.py` menjalankan browser Playwright, menerapkan filter kata kunci, serta
-opsional memanfaatkan OpenAI Chat Completions API untuk memilah tweet yang layak
+opsional memanfaatkan OpenAI API untuk memilah tweet yang layak
 dibalas.
 
 ## Fitur
@@ -21,7 +21,7 @@ dibalas.
    Instal paket yang diperlukan:
 
    ```bash
-   pip install requests playwright psutil pyfiglet rich
+   pip install openai playwright psutil pyfiglet rich
    ```
 
    Jalankan juga `playwright install` untuk menyiapkan browser Chromium.
