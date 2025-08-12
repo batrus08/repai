@@ -78,6 +78,51 @@ SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_cli
 AI_CACHE_TTL_MS = 86_400_000  # 24 jam
 AI_CACHE: Dict[str, Tuple[str, int]] = {}
 
+ENV_FILE = ".env"
+
+
+def load_env() -> None:
+    """Load key-value pairs from ENV_FILE into environment variables."""
+    if not os.path.exists(ENV_FILE):
+        return
+    try:
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    key, val = line.strip().split("=", 1)
+                    os.environ.setdefault(key, val)
+    except OSError:
+        pass
+
+
+def ensure_api_key() -> bool:
+    """Pastikan OPENAI_API_KEY tersedia; jika tidak, minta user dan simpan."""
+    if os.getenv("OPENAI_API_KEY"):
+        return True
+    try:
+        from getpass import getpass
+
+        key = getpass("Masukkan OPENAI_API_KEY: ").strip()
+    except Exception:
+        key = input("Masukkan OPENAI_API_KEY: ").strip()
+    if not key:
+        console.print("[bold red]OPENAI_API_KEY diperlukan untuk AI.[/]")
+        return False
+    env_vars: Dict[str, str] = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    env_vars[k] = v
+    env_vars["OPENAI_API_KEY"] = key
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        for k, v in env_vars.items():
+            f.write(f"{k}={v}\n")
+    os.environ["OPENAI_API_KEY"] = key
+    console.print("[green]OPENAI_API_KEY tersimpan ke .env[/]")
+    return True
+
 
 
 
@@ -459,6 +504,7 @@ async def key_listener(state: Dict[str, Any]) -> None:
 
 
 async def run() -> None:
+    load_env()
     cfg = load_config()
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
@@ -469,6 +515,8 @@ async def run() -> None:
     ai_enabled = cfg.get("ai_enabled", False)
     ai_timeout = cfg.get("ai_timeout_ms", 4000)
     pre_filter = cfg.get("pre_filter_keywords", True)
+    if ai_enabled and not ensure_api_key():
+        return
 
     scan_cfg = cfg["scan"]
     net_cfg = cfg["network"]
