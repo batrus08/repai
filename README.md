@@ -28,15 +28,15 @@ dibalas.
 
 2. **Konfigurasi**
 
-    Sunting `bot_config.json` sesuai kebutuhan. Jika `ai_enabled=true`,
-    siapkan variabel lingkungan `OPENAI_API_KEY` (bisa lewat file `.env`).
-    Nama model dapat diatur melalui `OPENAI_MODEL` atau gunakan bawaan
-    `gpt-5-nano`.
+   Sunting `bot_config.json` sesuai kebutuhan. Jika `ai_enabled=true`,
+   bot akan meminta `OPENAI_API_KEY` saat pertama kali dijalankan bila
+   belum tersedia dan menyimpannya ke file `.env`. Nama model dapat
+   diatur melalui `OPENAI_MODEL` atau gunakan bawaan `gpt-5-nano`.
 
 ## Menjalankan Bot
 
 ```bash
-# menjalankan bot; `OPENAI_API_KEY` harus tersedia bila `ai_enabled=true`
+# menjalankan bot; bila kunci belum ada, program akan memintanya
 python twt.py
 
 # atau langsung lewat variabel lingkungan
