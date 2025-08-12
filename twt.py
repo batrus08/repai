@@ -8,6 +8,7 @@ Fitur utama:
 * Prioritas kandidat berdasarkan waktu.
 * Dashboard Rich 5 kolom dengan kontrol interaktif.
 * Anti duplikasi balasan menggunakan log id atomik.
+* Melewati tweet yang tidak bisa dibalas (balasan ditutup).
 """
 
 from __future__ import annotations
@@ -373,7 +374,12 @@ async def attempt_reply(
                 "candidate_to_click": int((t1 - t0) * 1000),
                 "click_to_textbox": int((t2 - t1) * 1000),
             })
-        await page.click("[data-testid='tweetButton']", timeout=reply_cfg["submit_timeout_ms"])
+        send_btn = await page.query_selector("[data-testid='tweetButton']")
+        if not send_btn or await send_btn.get_attribute("aria-disabled") == "true":
+            stats["skip_closed"] = stats.get("skip_closed", 0) + 1
+            await page.keyboard.press("Escape")
+            return ReplyResult("skip", "reply_closed")
+        await send_btn.click(timeout=reply_cfg["submit_timeout_ms"])
         t3 = time.perf_counter()
     except TimeoutError:
         stats["net_error"] = stats.get("net_error", 0) + 1
@@ -384,6 +390,17 @@ async def attempt_reply(
         "click_to_textbox": int((t2 - t1) * 1000),
         "textbox_to_submit": int((t3 - t2) * 1000),
     }
+
+    try:
+        toast = await page.wait_for_selector("[data-testid='toast']", timeout=2000)
+        msg = (await toast.inner_text()).lower() if toast else ""
+        if "reply" in msg and ("can't" in msg or "cannot" in msg or "tidak" in msg):
+            stats["skip_closed"] = stats.get("skip_closed", 0) + 1
+            await page.keyboard.press("Escape")
+            return ReplyResult("skip", "reply_closed", durations)
+    except TimeoutError:
+        pass
+
     for k, v in durations.items():
         timers.setdefault(k, []).append(v)
         if len(timers[k]) > 10:

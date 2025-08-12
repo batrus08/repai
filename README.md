@@ -12,6 +12,8 @@ dibalas.
 - Dukungan klasifikasi niat jual/beli melalui OpenAI (model dari variabel lingkungan `OPENAI_MODEL`, default `gpt-5-nano`; hanya diperlukan jika `ai_enabled=true`).
 - Menampilkan statistik proses dan penggunaan sistem.
 - Log aktivitas menampilkan tweet yang dibalas atau dilewati beserta alasannya.
+- Menyimpan ID tweet yang sudah dibalas ke `replied_ids.json` sehingga tidak diulang ketika bot dijalankan kembali.
+- Melewati otomatis tweet yang tidak dapat dibalas (misalnya karena balasan ditutup).
 - Penanganan CAPTCHA secara manual.
 
 ## Persiapan
