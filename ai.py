@@ -19,14 +19,17 @@ class ZeroShotClient:
         self.timeout = timeout_ms / 1000
         self.min_delay = min_delay
         self._last_call = 0.0
+        # Lock to guard _last_call updates across concurrent tasks
+        self._lock = asyncio.Lock()
         self.hypothesis_template = hypothesis_template
 
     async def _throttle(self) -> None:
         """Pastikan ada jeda minimum antar panggilan API."""
-        delta = time.time() - self._last_call
-        if delta < self.min_delay:
-            await asyncio.sleep(self.min_delay - delta)
-        self._last_call = time.time()
+        async with self._lock:
+            delta = time.time() - self._last_call
+            if delta < self.min_delay:
+                await asyncio.sleep(self.min_delay - delta)
+            self._last_call = time.time()
 
     async def classify(
         self, text: str, candidate_labels: List[str]

@@ -150,11 +150,14 @@ def save_hf_token(token: str, path: str = "tokens.json") -> None:
     os.replace(tmp, path)
 
 
-def ensure_hf_token() -> str:
-    """Ensure HF_API_TOKEN exists by prompting user if needed."""
+async def ensure_hf_token() -> str:
+    """Ensure HF_API_TOKEN exists by prompting user if needed without blocking the event loop."""
     token = os.environ.get("HF_API_TOKEN") or load_hf_token()
     while not token:
-        token = input("Masukkan Hugging Face API token: ").strip()
+        # Use a thread to avoid blocking asyncio event loop
+        token = (
+            await asyncio.to_thread(input, "Masukkan Hugging Face API token: ")
+        ).strip()
     save_hf_token(token)
     os.environ["HF_API_TOKEN"] = token
     return token
@@ -179,14 +182,12 @@ def normalize_text(text: str) -> str:
 
 
 def passes_prefilter(text: str, pos_keywords: List[str], neg_keywords: List[str]) -> bool:
-    if not text:
+    """Return True if normalized *text* matches positive keywords and none of the negative ones."""
+    if not text or len(text) < 5:
         return False
-    t = normalize_text(text)
-    if len(t) < 5:
+    if not any(k in text for k in pos_keywords):
         return False
-    if not any(k.lower() in t for k in pos_keywords):
-        return False
-    if any(n.lower() in t for n in neg_keywords):
+    if any(n in text for n in neg_keywords):
         return False
     return True
 
@@ -506,8 +507,8 @@ async def run() -> None:
     cfg = load_config()
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
-    pos_kws = cfg.get("positive_keywords", [])
-    neg_kws = cfg.get("negative_keywords", [])
+    pos_kws = [normalize_text(k) for k in cfg.get("positive_keywords", [])]
+    neg_kws = [normalize_text(k) for k in cfg.get("negative_keywords", [])]
     reply_msg = cfg.get("reply_message", "")
 
     ai_enabled = cfg.get("ai_enabled", False)
@@ -527,7 +528,7 @@ async def run() -> None:
     log_preds = cfg.get("log_predictions", True)
 
     if ai_enabled:
-        ensure_hf_token()
+        await ensure_hf_token()
 
     scan_cfg = cfg["scan"]
     net_cfg = cfg["network"]
