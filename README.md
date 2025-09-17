@@ -177,6 +177,8 @@ OPENAI_API_KEY=sk-xxx python twt.py
 Bot akan membuka jendela browser dan mulai memindai tweet. Hentikan dengan
 `Ctrl+C`.
 
+689ae136d81c8197914e45ac7a081d3106430c81bc47e9d2
+
 ## Lisensi
 
 Proyek ini dirilis tanpa lisensi khusus. Gunakan dengan risiko sendiri.
