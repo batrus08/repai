@@ -7,9 +7,15 @@ from typing import Optional
 from openai import OpenAI, OpenAIError
 
 RETRY_STATUS = {429, 500, 502, 503, 504}
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+DEFAULT_MODEL = "gpt-5-nano"
 PRICE_PER_1K_TOKENS = 0.0005  # USD, estimasi kasar
 CLIENT: Optional[OpenAI] = None
+
+
+def _get_model_name() -> str:
+    """Ambil nama model terbaru dari variabel lingkungan."""
+    model = os.getenv("OPENAI_MODEL", "").strip()
+    return model or DEFAULT_MODEL
 
 
 async def ask_ai(system_msg: str, user_msg: str, *, max_tokens: int = 16, timeout: float = 15.0) -> Optional[str]:
@@ -29,7 +35,7 @@ async def ask_ai(system_msg: str, user_msg: str, *, max_tokens: int = 16, timeou
         try:
             resp = await asyncio.to_thread(
                 CLIENT.chat.completions.create,
-                model=MODEL,
+                model=_get_model_name(),
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},

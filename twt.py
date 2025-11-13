@@ -296,12 +296,24 @@ async def _has_login_indicator(page) -> tuple[bool, str]:
 
 def load_chrome_profile(session_cfg: Dict[str, Any]) -> str:
     """Pastikan direktori profil Chrome tersedia dan kembalikan path absolut."""
-    configured = session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")
-    profile_path = configured or os.path.join(os.getcwd(), "chrome_profile")
-    expanded = os.path.expanduser(profile_path)
-    os.makedirs(expanded, exist_ok=True)
-    console.log(f"[INFO] Using Chrome profile at: {expanded}")
-    return expanded
+    configured = (session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")).strip()
+
+    if configured:
+        expanded = os.path.abspath(os.path.expanduser(configured))
+        if not os.path.isdir(expanded):
+            raise FileNotFoundError(
+                f"Chrome profile directory tidak ditemukan di '{expanded}'. Pastikan path benar atau buka Chrome manual "
+                "untuk membuatnya terlebih dahulu."
+            )
+        console.log(f"[INFO] Using existing Chrome profile at: {expanded}")
+        return expanded
+
+    fallback = os.path.join(os.getcwd(), "chrome_profile")
+    os.makedirs(fallback, exist_ok=True)
+    console.log(
+        f"[WARN] session.profile_path kosong → membuat profil baru di {fallback}. Setel konfigurasi untuk memakai profil Chrome yang ada."
+    )
+    return fallback
 
 
 def resolve_chrome_executable(session_cfg: Dict[str, Any]) -> str:
@@ -770,7 +782,11 @@ async def run() -> None:
     session_cfg["profile_path"] = session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")
     session_cfg["chrome_executable"] = session_cfg.get("chrome_executable") or os.getenv("CHROME_EXECUTABLE_PATH") or os.getenv("CHROME_PATH") or ""
 
-    profile_path = load_chrome_profile(session_cfg)
+    try:
+        profile_path = load_chrome_profile(session_cfg)
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]Gagal memuat profil Chrome:[/] {exc}")
+        return
     pw = await async_playwright().start()
     launch_kwargs: Dict[str, Any] = {
         "user_data_dir": profile_path,
