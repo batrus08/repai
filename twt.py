@@ -41,6 +41,16 @@ from ai import classify_text
 
 console = Console()
 
+LOGIN_SUCCESS_SELECTORS = [
+    "[data-testid='AppTabBar_Profile_Link']",
+    "[data-testid='AppTabBar_Home_Link']",
+    "[data-testid='AppTabBar_Notifications_Link']",
+    "[data-testid='AppTabBar_DirectMessage_Link']",
+    "[data-testid='SideNav_AccountSwitcher_Button']",
+]
+
+LOGIN_URL_HINTS = ("/login", "/i/flow/login")
+
 # ---------------- Konfigurasi & util dasar -----------------
 
 CONFIG_PATH = "bot_config.json"
@@ -247,28 +257,80 @@ class ReplyResult:
 # ----------------- Login & navigasi -----------------
 
 
-async def wait_until_logged_in(page, max_ms: int) -> bool:
-    """Menunggu hingga ikon profil muncul yang menandakan login sukses."""
+async def _get_pathname(page) -> str:
     try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=max_ms)
-        await page.context.storage_state(path=COOKIE_FILE)
+        return await page.evaluate("() => window.location ? window.location.pathname : ''")
+    except Exception:
+        return ""
+
+
+async def _on_login_page(page) -> bool:
+    url = page.url or ""
+    if any(hint in url for hint in LOGIN_URL_HINTS):
         return True
-    except TimeoutError:
-        return False
+    path = await _get_pathname(page)
+    return bool(path and any(path.startswith(hint) for hint in LOGIN_URL_HINTS))
+
+
+async def _has_login_indicator(page) -> tuple[bool, str]:
+    """Return (True, reason) jika indikator login ditemukan dan bukan halaman login."""
+    if await _on_login_page(page):
+        return False, "still_on_login_page"
+    for selector in LOGIN_SUCCESS_SELECTORS:
+        try:
+            handle = await page.query_selector(selector)
+        except Exception:
+            handle = None
+        if handle:
+            return True, selector
+    return False, "selectors_missing"
+
+
+async def wait_until_logged_in(page, max_ms: int) -> bool:
+    """Menunggu hingga indikator login muncul dan menyimpan sesi."""
+    console.log(f"[login] Menunggu indikator login hingga {max_ms/1000:.1f}s…")
+    start = time.perf_counter()
+    reason = "selectors_missing"
+    while True:
+        ok, reason = await _has_login_indicator(page)
+        if ok:
+            console.log(f"[login] Indikator login ditemukan: {reason}.")
+            try:
+                await page.context.storage_state(path=COOKIE_FILE)
+                console.log("[login] Storage state diperbarui.")
+            except Exception as exc:
+                console.log(f"[login] Gagal menyimpan storage state: {exc}")
+            return True
+        if (time.perf_counter() - start) * 1000 >= max_ms:
+            console.log(f"[login] Indikator login tidak ditemukan ({reason}).")
+            return False
+        await asyncio.sleep(0.5)
 
 
 async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
     """Pastikan sesi login aktif dan halaman hasil pencarian siap."""
-    try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=3000)
+    ok, reason = await _has_login_indicator(page)
+    if ok:
         return True
-    except TimeoutError:
-        pass
 
+    console.log(f"[login] Indikator login belum tersedia ({reason}).")
+
+    if not await _on_login_page(page):
+        console.log("[login] Halaman saat ini bukan /login. Memuat ulang halaman pencarian…")
+        await resilient_goto(page, search_url, net_cfg, stats)
+        ok, _ = await _has_login_indicator(page)
+        if ok:
+            console.log("[login] Indikator muncul setelah reload search.")
+            return True
+
+    console.log("[login] Mengarahkan ulang ke halaman login untuk validasi sesi…")
     await resilient_goto(page, "https://x.com/login", net_cfg, stats)
     if await wait_until_logged_in(page, 120000):
+        console.log("[login] Login terverifikasi, kembali ke halaman pencarian.")
         await resilient_goto(page, search_url, net_cfg, stats)
         return True
+
+    console.log("[login] Tidak berhasil memverifikasi login setelah redirect.")
     return False
 
 
@@ -554,6 +616,7 @@ async def run() -> None:
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
     # buka halaman login dan tunggu sampai benar-benar masuk
+    console.log("[login] Membuka halaman login untuk validasi sesi awal…")
     await resilient_goto(page, "https://x.com/login", net_cfg, stats)
     login_spinner = Spinner("dots", text="Menunggu login…")
     with Live(login_spinner, console=console, refresh_per_second=10):
