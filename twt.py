@@ -49,6 +49,18 @@ LOGIN_SUCCESS_SELECTORS = [
     "[data-testid='SideNav_AccountSwitcher_Button']",
 ]
 
+# Selector tambahan & heuristik yang relatif stabil pada UI baru Twitter/X.
+LOGIN_FALLBACK_INDICATORS = [
+    "[data-testid='AppTabBar_Explore_Link']",
+    "[data-testid='AppTabBar_Lists_Link']",
+    "[data-testid='DMDrawer']",
+    "nav[role='navigation'] a[href='/home']",
+    "a[href='/compose/post']",
+    "a[href='/settings/profile']",
+    "a[href='/i/settings/profile']",
+    "[data-testid='SideNav_NewTweet_Button']",
+]
+
 LOGIN_URL_HINTS = ("/login", "/i/flow/login")
 
 # ---------------- Konfigurasi & util dasar -----------------
@@ -284,13 +296,26 @@ async def _has_login_indicator(page) -> tuple[bool, str]:
     """Return (True, reason) jika indikator login ditemukan dan bukan halaman login."""
     if await _on_login_page(page):
         return False, "still_on_login_page"
-    for selector in LOGIN_SUCCESS_SELECTORS:
+
+    selectors = LOGIN_SUCCESS_SELECTORS + LOGIN_FALLBACK_INDICATORS
+    for selector in selectors:
         try:
             handle = await page.query_selector(selector)
         except Exception:
             handle = None
         if handle:
             return True, selector
+
+    # UI X cukup fluktuatif; cek localStorage "active_user_id" sebagai indikator tambahan.
+    try:
+        has_active_user = await page.evaluate(
+            "() => { try { return Boolean(window?.localStorage?.getItem('active_user_id')); } catch (e) { return false; } }"
+        )
+    except Exception:
+        has_active_user = False
+    if has_active_user:
+        return True, "localStorage_active_user"
+
     return False, "selectors_missing"
 
 
