@@ -23,6 +23,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from urllib.parse import quote
@@ -40,6 +41,11 @@ from rich.spinner import Spinner
 from ai import classify_text
 
 console = Console()
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except Exception:  # pragma: no cover - dependency optional at runtime
+    _load_dotenv = None
 
 LOGIN_SUCCESS_SELECTORS = [
     "[data-testid='AppTabBar_Profile_Link']",
@@ -62,6 +68,12 @@ LOGIN_FALLBACK_INDICATORS = [
 ]
 
 LOGIN_URL_HINTS = ("/login", "/i/flow/login")
+
+
+class LoginState(str, Enum):
+    LOGGED_IN = "LOGGED_IN"
+    ON_LOGIN_PAGE = "ON_LOGIN_PAGE"
+    UNKNOWN_OR_ERROR = "UNKNOWN_OR_ERROR"
 
 # ---------------- Konfigurasi & util dasar -----------------
 
@@ -95,9 +107,6 @@ DEFAULT_DASHBOARD = {
 }
 
 DEFAULT_SESSION = {
-    "profile_path": "",
-    "chrome_executable": "",
-    "browser_channel": "chrome",
     "login_timeout_sec": 180,
     "login_check_interval_sec": 2,
 }
@@ -111,8 +120,108 @@ AI_CACHE: Dict[str, Tuple[str, int]] = {}
 ENV_FILE = ".env"
 
 
+@dataclass
+class BrowserEnvConfig:
+    user_data_dir: str
+    profile_name: str
+    executable_path: Optional[str]
+    cookies_path: Optional[str]
+    using_external_profile: bool
+
+
+def _expand(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def build_browser_env_config() -> BrowserEnvConfig:
+    user_data_root = os.getenv("CHROME_USER_DATA_DIR", "").strip()
+    profile_name = os.getenv("CHROME_PROFILE_NAME", "").strip() or "Default"
+    cookies_path = os.getenv("TWITTER_COOKIES_PATH", "").strip()
+    executable_override = os.getenv("CHROME_EXECUTABLE_PATH", "").strip() or os.getenv("CHROME_PATH", "").strip()
+
+    using_external_profile = bool(user_data_root)
+    if user_data_root:
+        resolved_root = _expand(user_data_root)
+        if not os.path.exists(resolved_root):
+            console.log(
+                f"[WARN] Provided CHROME_USER_DATA_DIR does not exist at {resolved_root}. Creating directory for you."
+            )
+            os.makedirs(resolved_root, exist_ok=True)
+        else:
+            console.log(f"[INFO] Using existing Chrome user data dir: {resolved_root}")
+            console.log("[WARN] Close regular Chrome before running the bot to avoid profile lock or crashes.")
+    else:
+        resolved_root = _expand(os.path.join(os.getcwd(), "bot_session"))
+        os.makedirs(resolved_root, exist_ok=True)
+        console.log(f"[INFO] Using dedicated bot Chrome profile at: {resolved_root}")
+
+    console.log(f"[INFO] Using Chrome profile directory: {profile_name}")
+
+    executable_path: Optional[str] = None
+    if executable_override:
+        expanded_exec = _expand(executable_override)
+        if os.path.exists(expanded_exec):
+            executable_path = expanded_exec
+            console.log(f"[INFO] Chrome executable: {expanded_exec}")
+        else:
+            console.log(
+                f"[WARN] Chrome executable path '{expanded_exec}' not found. Falling back to Playwright chrome channel."
+            )
+    else:
+        console.log("[WARN] Chrome executable path not set; using Playwright chrome channel.")
+
+    cookies_abs = _expand(cookies_path) if cookies_path else None
+
+    return BrowserEnvConfig(
+        user_data_dir=resolved_root,
+        profile_name=profile_name,
+        executable_path=executable_path,
+        cookies_path=cookies_abs,
+        using_external_profile=using_external_profile,
+    )
+
+
+async def maybe_apply_twitter_cookies(context, cookies_path: Optional[str]) -> None:
+    """Load cookies from TWITTER_COOKIES_PATH if provided."""
+    if not cookies_path:
+        return
+    if not os.path.exists(cookies_path):
+        console.log(f"[WARN] TWITTER_COOKIES_PATH not found at {cookies_path}. Skipping cookie import.")
+        return
+
+    try:
+        with open(cookies_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        console.log(f"[WARN] Failed to parse cookies JSON at {cookies_path}: {exc}")
+        return
+    except OSError as exc:
+        console.log(f"[WARN] Failed to read cookies file at {cookies_path}: {exc}")
+        return
+
+    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+        cookies = data["cookies"]
+    elif isinstance(data, list):
+        cookies = data
+    else:
+        console.log(f"[WARN] Cookies file at {cookies_path} must be a list or {{'cookies': []}} structure.")
+        return
+
+    valid_cookies = [c for c in cookies if isinstance(c, dict) and c.get("name") and c.get("value")]
+    if not valid_cookies:
+        console.log(f"[WARN] No valid cookies found inside {cookies_path}. Skipping import.")
+        return
+
+    await context.add_cookies(valid_cookies)
+    console.log(f"[INFO] Loaded {len(valid_cookies)} cookies into the browser context from {cookies_path}.")
+
+
 def load_env() -> None:
-    """Load key-value pairs from ENV_FILE into environment variables."""
+    """Load key-value pairs from `.env` using python-dotenv if available."""
+    if _load_dotenv is not None:
+        _load_dotenv(ENV_FILE, override=False)
+        return
+
     if not os.path.exists(ENV_FILE):
         return
     try:
@@ -293,10 +402,7 @@ async def _on_login_page(page) -> bool:
 
 
 async def _has_login_indicator(page) -> tuple[bool, str]:
-    """Return (True, reason) jika indikator login ditemukan dan bukan halaman login."""
-    if await _on_login_page(page):
-        return False, "still_on_login_page"
-
+    """Return (True, reason) jika indikator login ditemukan."""
     selectors = LOGIN_SUCCESS_SELECTORS + LOGIN_FALLBACK_INDICATORS
     for selector in selectors:
         try:
@@ -319,103 +425,85 @@ async def _has_login_indicator(page) -> tuple[bool, str]:
     return False, "selectors_missing"
 
 
-def load_chrome_profile(session_cfg: Dict[str, Any]) -> str:
-    """Pastikan direktori profil Chrome tersedia dan kembalikan path absolut."""
-    configured = (session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")).strip()
+async def determine_login_state(page) -> tuple[LoginState, str]:
+    """Kembalikan status login yang lebih eksplisit."""
+    if await _on_login_page(page):
+        return LoginState.ON_LOGIN_PAGE, "login_page"
 
-    if configured:
-        expanded = os.path.abspath(os.path.expanduser(configured))
-        if not os.path.isdir(expanded):
-            raise FileNotFoundError(
-                f"Chrome profile directory tidak ditemukan di '{expanded}'. Pastikan path benar atau buka Chrome manual "
-                "untuk membuatnya terlebih dahulu."
-            )
-        console.log(f"[INFO] Using existing Chrome profile at: {expanded}")
-        return expanded
-
-    fallback = os.path.join(os.getcwd(), "chrome_profile")
-    os.makedirs(fallback, exist_ok=True)
-    console.log(
-        f"[WARN] session.profile_path kosong → membuat profil baru di {fallback}. Setel konfigurasi untuk memakai profil Chrome yang ada."
-    )
-    return fallback
-
-
-def resolve_chrome_executable(session_cfg: Dict[str, Any]) -> str:
-    """Kembalikan path executable Chrome jika ditentukan pengguna."""
-    configured = (
-        session_cfg.get("chrome_executable")
-        or os.getenv("CHROME_EXECUTABLE_PATH")
-        or os.getenv("CHROME_PATH")
-        or ""
-    )
-    if not configured:
-        console.log("[WARN] Chrome executable path not set; relying on Playwright channel.")
-        return ""
-    expanded = os.path.expanduser(configured)
-    if not os.path.exists(expanded):
-        console.log(f"[WARN] Chrome executable not found at {expanded}; falling back to channel.")
-        return ""
-    console.log(f"[INFO] Using Chrome executable at: {expanded}")
-    return expanded
-
-
-async def is_logged_in(page) -> tuple[bool, str]:
-    """Periksa apakah pengguna sudah login berdasarkan indikator global."""
     logged, reason = await _has_login_indicator(page)
     if logged:
-        return True, reason
-    if await _on_login_page(page):
-        return False, "login_page"
+        return LoginState.LOGGED_IN, reason
+
     url = page.url or ""
     if any(hint in url for hint in LOGIN_URL_HINTS):
-        return False, "login_url"
-    return False, reason
+        return LoginState.ON_LOGIN_PAGE, "login_url"
+
+    return LoginState.UNKNOWN_OR_ERROR, reason
 
 
-async def _wait_for_login_confirmation(page, timeout_sec: int, interval_sec: int) -> bool:
+async def wait_for_manual_login(page, timeout_sec: int, interval_sec: int) -> bool:
+    """Tunggu hingga user login manual di jendela browser."""
+    console.print(
+        "[bold yellow]X login required. Please complete the sign-in flow in the opened browser window.[/]"
+    )
     start = time.time()
     while time.time() - start < timeout_sec:
-        logged, _ = await is_logged_in(page)
-        if logged:
+        state, _ = await determine_login_state(page)
+        if state is LoginState.LOGGED_IN:
             return True
         await asyncio.sleep(interval_sec)
     return False
 
 
-async def run_login_flow_if_needed(
+async def is_logged_in(page) -> tuple[bool, str]:
+    """Periksa apakah pengguna sudah login berdasarkan indikator global."""
+    state, reason = await determine_login_state(page)
+    return state is LoginState.LOGGED_IN, reason
+
+
+LOGIN_PAGE_URL = "https://x.com/login"
+
+
+async def ensure_logged_in_state(
     page,
     net_cfg: Dict[str, int],
     stats: Dict[str, int],
-    *,
-    timeout_sec: int,
-    interval_sec: int,
+    session_cfg: Dict[str, Any],
+    target_url: str,
 ) -> bool:
-    """Pastikan sesi aktif. Jika tidak, arahkan ke /login dan tunggu interaksi manual."""
-    logged, reason = await is_logged_in(page)
-    if logged:
-        console.log(f"[INFO] Session valid → skipping login (indicator: {reason})")
-        return True
+    """Pastikan user mendapatkan kesempatan login manual sebelum melanjutkan."""
+    timeout_sec = int(session_cfg.get("login_timeout_sec", 180))
+    interval_sec = int(session_cfg.get("login_check_interval_sec", 2))
+    max_unknown_attempts = max(2, net_cfg.get("health_max_retries", 1))
+    unknown_attempts = 0
 
-    console.log(f"[INFO] Session invalid → opening X login page (reason: {reason})")
-    login_url = "https://x.com/login"
-    max_attempts = max(1, net_cfg.get("health_max_retries", 1))
-    for attempt in range(max_attempts):
-        ok = await resilient_goto(page, login_url, net_cfg, stats)
-        if not ok:
-            console.log(f"[ERROR] Page stuck, retrying … ({attempt + 1}/{max_attempts})")
-            continue
-
-        console.print(
-            "[bold yellow]Silakan login ke X secara manual di jendela browser. Bot akan lanjut otomatis setelah selesai.[/]"
-        )
-        success = await _wait_for_login_confirmation(page, timeout_sec, interval_sec)
-        if success:
-            console.log("[INFO] Session valid → skipping login")
+    while True:
+        state, reason = await determine_login_state(page)
+        if state is LoginState.LOGGED_IN:
+            console.log(f"[INFO] Detected valid X session. Continuing without login. (indicator: {reason})")
             return True
 
-        console.log("[WARN] Login indicator missing setelah timeout; memuat ulang halaman login.")
-    return False
+        if state is LoginState.ON_LOGIN_PAGE:
+            console.log("[INFO] X login required. Please login in the browser window.")
+            success = await wait_for_manual_login(page, timeout_sec, interval_sec)
+            if success:
+                console.log("[INFO] Login detected. Session will be reused next time.")
+                return True
+            console.log("[WARN] Login not detected before timeout. Reloading login page for another attempt.")
+            if not await resilient_goto(page, LOGIN_PAGE_URL, net_cfg, stats):
+                return False
+            continue
+
+        unknown_attempts += 1
+        if unknown_attempts > max_unknown_attempts:
+            console.log("[ERROR] Cannot determine X login state. Please check manually.")
+            return False
+
+        console.log(
+            f"[WARN] Cannot determine X login state (reason: {reason}). Reloading page ({unknown_attempts}/{max_unknown_attempts})."
+        )
+        if not await resilient_goto(page, target_url, net_cfg, stats):
+            return False
 
 
 async def ensure_session_valid(
@@ -426,11 +514,11 @@ async def ensure_session_valid(
     session_cfg: Dict[str, Any],
 ) -> bool:
     """Validasi sesi dan pastikan halaman target siap dipindai."""
-    timeout_sec = int(session_cfg.get("login_timeout_sec", 180))
-    interval_sec = int(session_cfg.get("login_check_interval_sec", 2))
-    if not await run_login_flow_if_needed(
-        page, net_cfg, stats, timeout_sec=timeout_sec, interval_sec=interval_sec
-    ):
+    if not await resilient_goto(page, target_url, net_cfg, stats):
+        console.log("[ERROR] Page stuck, retrying … (navigasi awal ke target)")
+        return False
+
+    if not await ensure_logged_in_state(page, net_cfg, stats, session_cfg, target_url):
         return False
 
     if not await resilient_goto(page, target_url, net_cfg, stats):
@@ -804,33 +892,24 @@ async def run() -> None:
     activity: List[str] = []
 
     session_cfg = cfg["session"].copy()
-    session_cfg["profile_path"] = session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")
-    session_cfg["chrome_executable"] = session_cfg.get("chrome_executable") or os.getenv("CHROME_EXECUTABLE_PATH") or os.getenv("CHROME_PATH") or ""
-
-    try:
-        profile_path = load_chrome_profile(session_cfg)
-    except FileNotFoundError as exc:
-        console.print(f"[bold red]Gagal memuat profil Chrome:[/] {exc}")
-        return
+    browser_env = build_browser_env_config()
     pw = await async_playwright().start()
     launch_kwargs: Dict[str, Any] = {
-        "user_data_dir": profile_path,
+        "user_data_dir": browser_env.user_data_dir,
         "headless": False,
-        "args": ["--start-maximized"],
+        "args": [
+            "--start-maximized",
+            f"--profile-directory={browser_env.profile_name}",
+        ],
     }
 
-    channel = session_cfg.get("browser_channel") or "chrome"
-    if channel != "chrome":
-        console.log("[WARN] Memaksa channel browser ke 'chrome' sesuai konfigurasi baru.")
-        channel = "chrome"
-    launch_kwargs["channel"] = channel
-
-    chrome_exec = resolve_chrome_executable(session_cfg)
-    if chrome_exec:
-        launch_kwargs["executable_path"] = chrome_exec
-        launch_kwargs.pop("channel", None)
+    if browser_env.executable_path:
+        launch_kwargs["executable_path"] = browser_env.executable_path
+    else:
+        launch_kwargs["channel"] = "chrome"
 
     browser = await pw.chromium.launch_persistent_context(**launch_kwargs)
+    await maybe_apply_twitter_cookies(browser, browser_env.cookies_path)
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
     if not await ensure_session_valid(page, SEARCH_URL, net_cfg, stats, session_cfg):
