@@ -117,12 +117,5 @@
     "compact": true,
     "show_url": true,
     "interactive_keys": true
-  },
-  "session": {
-    "profile_path": "",
-    "chrome_executable": "",
-    "browser_channel": "chrome",
-    "login_timeout_sec": 180,
-    "login_check_interval_sec": 2
   }
 }

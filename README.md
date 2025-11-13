@@ -97,7 +97,7 @@ Gunakan hak `sudo` untuk seluruh perintah kecuali disebutkan berbeda.
 6. **Pasang dependensi Python**
 
    ```bash
-   pip install openai playwright psutil pyfiglet rich
+   pip install openai playwright psutil pyfiglet rich python-dotenv
    ```
 
    Jika Anda memiliki `requirements.txt`, jalankan `pip install -r requirements.txt`.
@@ -164,55 +164,99 @@ Gunakan hak `sudo` untuk seluruh perintah kecuali disebutkan berbeda.
 
 ## Konfigurasi Bot
 
-Contoh entri penting pada `bot_config.json`:
+File `bot_config.json` hanya memuat logika bisnis: kata kunci pencarian, pesan
+balasan, pengaturan AI, dan opsi dashboard. Contoh ringkas:
 
 ```json
 {
-  "search_query": "(jual OR beli) laptop -giveaway",
+  "search_config": {
+    "keyword": "chatgpt",
+    "hashtag": "zonauang",
+    "live": true
+  },
   "positive_keywords": ["beli", "butuh", "mencari"],
   "negative_keywords": ["giveaway", "hadiah", "bot"],
+  "reply_message": "Halo! Kami bisa bantu kebutuhan Anda.",
   "ai_enabled": true,
-  "reply_template": "Halo! Kami bisa bantu kebutuhan laptop Anda.",
-  "cooldown_seconds": 30,
-  "session": {
-    "profile_path": "C:/Users/me/ChromeProfileForBot",
-    "chrome_executable": "C:/Program Files/Google/Chrome/Application/chrome.exe",
-    "browser_channel": "chrome",
-    "login_timeout_sec": 240,
-    "login_check_interval_sec": 2
-  }
+  "ai_timeout_ms": 4000,
+  "pre_filter_keywords": true
 }
 ```
 
-Penjelasan singkat:
+Kustomisasi Chrome/profile kini **sepenuhnya** berpindah ke `.env` sehingga
+`bot_config.json` tidak lagi memiliki blok `session`.
 
-- `search_query` — Query pencarian X standar dengan operator AND/OR/NOT.
-- `positive_keywords` — Kata yang wajib ada agar tweet dianggap relevan.
-- `negative_keywords` — Kata yang memicu penolakan otomatis.
-- `ai_enabled` — Mengaktifkan modul `ai.py`. Pastikan OPENAI_API_KEY tersedia.
-- `reply_template` — Pesan dasar yang akan dikirim. Anda bisa memformat ulang di
-  kode untuk personalisasi lebih lanjut.
-- `cooldown_seconds` — Interval minimal antar balasan agar tidak dianggap spam.
-- Bagian `session` — Pengaturan Chrome persisten (lihat penjelasan di bawah).
+## Konfigurasi `.env`
 
-### Pengaturan Chrome & Login Persisten
+Gunakan file `.env` di root proyek (dibaca otomatis oleh `python-dotenv`).
+Contoh isi lengkap:
 
-- **Profil Chrome khusus** — Setel `session.profile_path` (atau variabel
-  lingkungan `CHROME_PROFILE_PATH`) ke folder user-data Chrome yang ingin
-  dipakai bot. Folder akan dibuat otomatis jika belum ada dan dipakai kembali di
-  eksekusi berikutnya.
-- **Path Chrome manual** — Jika ingin memaksa executable tertentu, isi
-  `session.chrome_executable` atau variabel `CHROME_EXECUTABLE_PATH`. Jika
-  dikosongkan, bot memakai Playwright channel `chrome` bawaan.
-- **Alur login** — Saat profil tidak memiliki sesi X yang valid, bot membuka
-  `https://x.com/login`, menampilkan log `[INFO] Session invalid → opening X login
-  page`, dan menunggu Anda login manual sekali. Setelah sukses, data tersimpan di
-  profil tersebut dan log `[INFO] Session valid → skipping login` akan muncul di
-  run berikutnya.
-- **Validasi otomatis** — Setiap awal siklus, bot mengecek indikator navbar X
-  menggunakan fungsi `is_logged_in()`. Jika indikator hilang, log
-  `[WARN] Login indicator missing …` muncul dan bot berhenti agar Anda bisa
-  memperbarui sesi.
+```ini
+OPENAI_API_KEY=sk-....
+OPENAI_MODEL=gpt-5-nano
+CHROME_USER_DATA_DIR=C:/Users/Nama/AppData/Local/Google/Chrome/User Data
+CHROME_PROFILE_NAME=Profile 2
+CHROME_EXECUTABLE_PATH=C:/Program Files/Google/Chrome/Application/chrome.exe
+TWITTER_COOKIES_PATH=D:/backup/twitter_cookies.json
+```
+
+Penjelasan variabel:
+
+- **OPENAI_API_KEY** — Wajib jika `ai_enabled=true`.
+- **CHROME_USER_DATA_DIR** — Path *root* user data Chrome, contoh
+  `C:/Users/Anda/AppData/Local/Google/Chrome/User Data`. Cara termudah adalah
+  membuka `chrome://version`, salin `Profile Path`, lalu hapus bagian akhir
+  seperti `\Default` sehingga tersisa direktori `User Data`. Kosongkan nilai ini
+  jika ingin memakai profil khusus bot (`./bot_session`).
+- **CHROME_PROFILE_NAME** — Nama folder profil di dalam `User Data`, misalnya
+  `Default`, `Profile 1`, `Profile 2`, atau `Profile 311`. Anda bisa melihat
+  daftar folder tersebut langsung di dalam direktori `User Data` atau mencocokkan
+  dengan `Profile Path` di `chrome://version`. Jika dikosongkan maka bot memakai
+  `Default`.
+- **CHROME_EXECUTABLE_PATH** *(opsional)* — Isi jika ingin memaksa binary
+  tertentu. Contoh: `C:/Program Files/Google/Chrome/Application/chrome.exe`. Jika
+  dibiarkan kosong, Playwright memakai channel `chrome` bawaannya.
+- **TWITTER_COOKIES_PATH** *(opsional)* — Path ke file JSON export cookies X
+  (misal dari extension Chrome). Jika tersedia, cookies tersebut akan di-load ke
+  context setelah browser terbuka.
+
+> **Tips mencari path dengan aman**
+>
+> 1. Tutup semua jendela Chrome terlebih dahulu.
+> 2. Buka Chrome kembali, kunjungi `chrome://version`, dan catat `Profile Path`.
+> 3. Salin direktori `User Data` untuk `CHROME_USER_DATA_DIR` dan nama folder
+>    terakhir sebagai `CHROME_PROFILE_NAME`.
+> 4. Jika ingin profil terpisah, biarkan `CHROME_USER_DATA_DIR` kosong sehingga
+>    bot membuat folder `./bot_session` sendiri lalu login manual satu kali.
+
+## Alur Pertama Kali Berjalan
+
+1. Isi `.env` seperti contoh di atas.
+2. Jika Anda menunjuk `CHROME_USER_DATA_DIR` milik Chrome utama, **tutup semua**
+   jendela Chrome terlebih dahulu agar profil tidak terkunci.
+3. Jalankan `python twt.py`. Browser akan terbuka menggunakan profil yang Anda
+   pilih.
+4. Jika bot mendeteksi bahwa Anda belum login:
+   - Terminal akan menampilkan log `[INFO] X login required. Please login in the browser window.`
+   - Jendela browser akan menampilkan halaman login (`https://x.com/login`).
+   - Login secara manual sekali saja. Bot menunggu hingga indikator login muncul.
+5. Setelah login sukses, bot menavigasi ulang ke halaman pencarian dan memulai
+   siklus pemindaian. Eksekusi berikutnya akan langsung memakai sesi yang sama.
+
+## Catatan Penting & Peringatan
+
+- Jangan menjalankan bot bersamaan dengan Chrome biasa di `CHROME_USER_DATA_DIR`
+  yang sama. Hal tersebut dapat menyebabkan pesan error
+  `BrowserType.launch_persistent_context: Target page, context or browser has been closed`
+  karena profil terkunci.
+- Untuk penggunaan yang paling aman, biarkan `CHROME_USER_DATA_DIR` kosong agar
+  bot membuat profil `./bot_session` sendiri lalu login khusus di profil itu.
+- Jika ingin memakai profil produksi, pertimbangkan untuk menyalin seluruh
+  folder `User Data/Profile X` ke lokasi berbeda agar tidak mengganggu aktivitas
+  harian Anda.
+- Pastikan file cookies eksternal (`TWITTER_COOKIES_PATH`) berasal dari export
+  yang valid (`[ {"name": "auth_token", ... } ]`). Bot akan menolak file yang
+  tidak bisa di-parse.
 
 ---
 
@@ -251,13 +295,15 @@ Hentikan dengan `Ctrl+C`. Playwright akan menutup browser secara otomatis.
 
 ## Troubleshooting
 
-| Masalah                                     | Penyebab Umum                                         | Solusi                                                                 |
-| ------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------- |
+| Masalah                                     | Penyebab Umum                                         | Solusi                                                    |
+| ------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------- |
 | Playwright gagal start Chromium             | Dependensi sistem kurang                             | Jalankan `playwright install --with-deps chromium` dan pastikan paket GTK terpasang. |
 | Bot macet karena CAPTCHA                    | X mendeteksi aktivitas otomatis                      | Selesaikan CAPTCHA secara manual, kemudian lanjutkan eksekusi.         |
 | Galat `OPENAI_API_KEY not set`             | Variabel lingkungan belum tersedia                   | Ekspor `OPENAI_API_KEY` atau buat `.env` sesuai panduan.               |
 | Tweet di-skip terus                         | Filter terlalu ketat atau cooldown terlalu tinggi    | Tinjau `bot_config.json`, kurangi kata negatif atau percepat `cooldown`.
 | `replied_ids.json` tumbuh besar             | Bot berjalan lama tanpa pembersihan                  | Arsipkan atau hapus entri lama secara berkala (tetap backup terlebih dahulu).
+| `BrowserType.launch_persistent_context: Target page, context or browser has been closed` | Profil Chrome sedang dipakai oleh Chrome biasa atau path user-data salah | Tutup semua Chrome di profil tersebut, atau kosongkan `CHROME_USER_DATA_DIR` agar bot memakai profil khusus (`./bot_session`). |
+| Pesan `Sesi/cookies X tidak valid` / bot tidak mendeteksi login | Belum pernah login di profil itu atau cookies sudah kedaluwarsa | Jalankan bot, tunggu halaman login, lakukan login manual hingga muncul log `[INFO] Login detected. Session will be reused next time.]`. |
 
 ---
 
