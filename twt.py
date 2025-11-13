@@ -68,6 +68,8 @@ DEFAULT_NETWORK = {
     "timeout_ms": 15000,
     "max_retries": 3,
     "retry_backoff_ms": 1200,
+    "health_max_retries": 3,
+    "stuck_wait_ms": 2000,
 }
 
 DEFAULT_REPLY = {
@@ -341,8 +343,88 @@ async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[st
             await page.goto(url, timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
             await detect_captcha(page, stats)
             return True
-        except Exception:
+        except Exception as exc:
+            stats["goto_retry"] = stats.get("goto_retry", 0) + 1
+            console.log(f"[net] goto gagal (attempt {attempt + 1}/{net_cfg['max_retries']}): {exc}")
             await asyncio.sleep(net_cfg["retry_backoff_ms"] / 1000 * (attempt + 1))
+    return False
+
+
+async def _safe_query(page, selector: str) -> bool:
+    try:
+        return bool(await page.query_selector(selector))
+    except Exception:
+        return False
+
+
+async def _page_ready_state(page) -> str:
+    try:
+        return await page.evaluate("() => document.readyState || ''")
+    except Exception:
+        return ""
+
+
+async def _timeline_has_error(page) -> bool:
+    error_selectors = [
+        "text='Something went wrong'",
+        "text='Try again'",
+        "text='Reload'",
+        "[data-testid='error-detail']",
+    ]
+    for sel in error_selectors:
+        if await _safe_query(page, sel):
+            return True
+    return False
+
+
+async def timeline_looks_stuck(page) -> bool:
+    """Heuristik sederhana untuk mendeteksi timeline yang macet/half-loaded."""
+    ready_state = await _page_ready_state(page)
+    spinner = await _safe_query(page, "div[role='progressbar']")
+    has_error = await _timeline_has_error(page)
+    has_article = await _safe_query(page, "article")
+    if has_error:
+        return True
+    if spinner and ready_state != "complete":
+        return True
+    if not has_article:
+        if ready_state != "complete":
+            return True
+        empty_ok = await _safe_query(page, "text='No results'") or await _safe_query(page, "text='No results for'")
+        return not empty_ok
+    return False
+
+
+async def recover_timeline(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int], reason: str) -> None:
+    stats["page_recoveries"] = stats.get("page_recoveries", 0) + 1
+    console.log(f"[health] Memicu pemulihan timeline ({reason}).")
+    try:
+        await page.reload(timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
+        return
+    except Exception as exc:
+        stats["reload_fail"] = stats.get("reload_fail", 0) + 1
+        console.log(f"[health] Reload gagal: {exc}. Memaksa goto ulang.")
+    await resilient_goto(page, search_url, net_cfg, stats)
+
+
+async def ensure_timeline_ready(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
+    """Pastikan artikel timeline termuat dan tidak macet sebelum memproses siklus."""
+    max_attempts = net_cfg.get("health_max_retries", 1)
+    for attempt in range(max_attempts):
+        try:
+            await page.wait_for_selector("article", timeout=net_cfg["timeout_ms"])
+        except TimeoutError:
+            stats["timeline_timeout"] = stats.get("timeline_timeout", 0) + 1
+            await recover_timeline(page, search_url, net_cfg, stats, reason="wait_timeout")
+            await asyncio.sleep(net_cfg["stuck_wait_ms"] / 1000)
+            continue
+
+        if not await timeline_looks_stuck(page):
+            return True
+
+        stats["timeline_stuck"] = stats.get("timeline_stuck", 0) + 1
+        await recover_timeline(page, search_url, net_cfg, stats, reason="half_loaded")
+        await asyncio.sleep(net_cfg["stuck_wait_ms"] / 1000)
     return False
 
 
@@ -628,6 +710,11 @@ async def run() -> None:
         return
 
     await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+    if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
+        console.print("[bold red]Halaman pencarian tidak siap setelah beberapa percobaan.[/]")
+        await browser.close()
+        await pw.stop()
+        return
     work_spinner = Spinner("line")
 
     if cfg["dashboard"].get("interactive_keys", True):
@@ -643,10 +730,8 @@ async def run() -> None:
             if not logged_in:
                 await asyncio.sleep(1)
                 continue
-            try:
-                await page.wait_for_selector("article", timeout=net_cfg["timeout_ms"])
-            except TimeoutError:
-                await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+            if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
+                await asyncio.sleep(1)
                 continue
             refreshed = False
 
@@ -709,7 +794,8 @@ async def run() -> None:
             if not new_candidates:
                 no_new += 1
                 if state["force_refresh"] or no_new >= scan_cfg["no_new_cycles_before_refresh"]:
-                    await page.reload()
+                    reason = "force_refresh" if state["force_refresh"] else "stale_timeline"
+                    await recover_timeline(page, SEARCH_URL, net_cfg, stats, reason=reason)
                     refreshed = True
                     state["force_refresh"] = False
                     no_new = 0
