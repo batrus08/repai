@@ -55,8 +55,6 @@ LOGIN_URL_HINTS = ("/login", "/i/flow/login")
 
 CONFIG_PATH = "bot_config.json"
 REPLIED_LOG = "replied_ids.json"
-SESSION_DIR = "bot_session"
-
 DEFAULT_SCAN = {
     "scan_interval_ms": 1500,
     "no_new_cycles_before_refresh": 6,
@@ -85,10 +83,11 @@ DEFAULT_DASHBOARD = {
 }
 
 DEFAULT_SESSION = {
-    "user_data_dir": SESSION_DIR,
-    "chrome_profile_dir": "",
+    "profile_path": "",
+    "chrome_executable": "",
     "browser_channel": "chrome",
-    "cookies_path": "",
+    "login_timeout_sec": 180,
+    "login_check_interval_sec": 2,
 }
 
 # Default search URL akan dibangun ulang dari config
@@ -295,33 +294,120 @@ async def _has_login_indicator(page) -> tuple[bool, str]:
     return False, "selectors_missing"
 
 
-async def apply_session_cookies(context, cookies_path: str) -> bool:
-    """Tambahkan cookies eksternal (hasil export Chrome) ke konteks browser."""
-    if not cookies_path:
-        return False
-    expanded = os.path.expanduser(cookies_path)
+def load_chrome_profile(session_cfg: Dict[str, Any]) -> str:
+    """Pastikan direktori profil Chrome tersedia dan kembalikan path absolut."""
+    configured = session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")
+    profile_path = configured or os.path.join(os.getcwd(), "chrome_profile")
+    expanded = os.path.expanduser(profile_path)
+    os.makedirs(expanded, exist_ok=True)
+    console.log(f"[INFO] Using Chrome profile at: {expanded}")
+    return expanded
+
+
+def resolve_chrome_executable(session_cfg: Dict[str, Any]) -> str:
+    """Kembalikan path executable Chrome jika ditentukan pengguna."""
+    configured = (
+        session_cfg.get("chrome_executable")
+        or os.getenv("CHROME_EXECUTABLE_PATH")
+        or os.getenv("CHROME_PATH")
+        or ""
+    )
+    if not configured:
+        console.log("[WARN] Chrome executable path not set; relying on Playwright channel.")
+        return ""
+    expanded = os.path.expanduser(configured)
     if not os.path.exists(expanded):
-        console.log(f"[session] File cookies tidak ditemukan: {expanded}")
+        console.log(f"[WARN] Chrome executable not found at {expanded}; falling back to channel.")
+        return ""
+    console.log(f"[INFO] Using Chrome executable at: {expanded}")
+    return expanded
+
+
+async def is_logged_in(page) -> tuple[bool, str]:
+    """Periksa apakah pengguna sudah login berdasarkan indikator global."""
+    logged, reason = await _has_login_indicator(page)
+    if logged:
+        return True, reason
+    if await _on_login_page(page):
+        return False, "login_page"
+    url = page.url or ""
+    if any(hint in url for hint in LOGIN_URL_HINTS):
+        return False, "login_url"
+    return False, reason
+
+
+async def _wait_for_login_confirmation(page, timeout_sec: int, interval_sec: int) -> bool:
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        logged, _ = await is_logged_in(page)
+        if logged:
+            return True
+        await asyncio.sleep(interval_sec)
+    return False
+
+
+async def run_login_flow_if_needed(
+    page,
+    net_cfg: Dict[str, int],
+    stats: Dict[str, int],
+    *,
+    timeout_sec: int,
+    interval_sec: int,
+) -> bool:
+    """Pastikan sesi aktif. Jika tidak, arahkan ke /login dan tunggu interaksi manual."""
+    logged, reason = await is_logged_in(page)
+    if logged:
+        console.log(f"[INFO] Session valid → skipping login (indicator: {reason})")
+        return True
+
+    console.log(f"[INFO] Session invalid → opening X login page (reason: {reason})")
+    login_url = "https://x.com/login"
+    max_attempts = max(1, net_cfg.get("health_max_retries", 1))
+    for attempt in range(max_attempts):
+        ok = await resilient_goto(page, login_url, net_cfg, stats)
+        if not ok:
+            console.log(f"[ERROR] Page stuck, retrying … ({attempt + 1}/{max_attempts})")
+            continue
+
+        console.print(
+            "[bold yellow]Silakan login ke X secara manual di jendela browser. Bot akan lanjut otomatis setelah selesai.[/]"
+        )
+        success = await _wait_for_login_confirmation(page, timeout_sec, interval_sec)
+        if success:
+            console.log("[INFO] Session valid → skipping login")
+            return True
+
+        console.log("[WARN] Login indicator missing setelah timeout; memuat ulang halaman login.")
+    return False
+
+
+async def ensure_session_valid(
+    page,
+    target_url: str,
+    net_cfg: Dict[str, int],
+    stats: Dict[str, int],
+    session_cfg: Dict[str, Any],
+) -> bool:
+    """Validasi sesi dan pastikan halaman target siap dipindai."""
+    timeout_sec = int(session_cfg.get("login_timeout_sec", 180))
+    interval_sec = int(session_cfg.get("login_check_interval_sec", 2))
+    if not await run_login_flow_if_needed(
+        page, net_cfg, stats, timeout_sec=timeout_sec, interval_sec=interval_sec
+    ):
         return False
-    data = load_json(expanded)
-    cookies: List[Dict[str, Any]] = []
-    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
-        cookies = data["cookies"]
-    elif isinstance(data, list):
-        cookies = data
-    else:
-        console.log(f"[session] Format cookies tidak dikenali: {expanded}")
+
+    if not await resilient_goto(page, target_url, net_cfg, stats):
+        console.log("[ERROR] Page stuck, retrying … (navigasi ke target)")
         return False
-    valid = [c for c in cookies if isinstance(c, dict) and c.get("name") and c.get("value")]
-    if not valid:
-        console.log(f"[session] Tidak ada cookie valid di {expanded}")
+
+    logged, reason = await is_logged_in(page)
+    if not logged:
+        console.log(f"[WARN] Login indicator missing setelah menuju target: {reason}")
         return False
-    try:
-        await context.add_cookies(valid)
-    except Exception as exc:
-        console.log(f"[session] Gagal menerapkan cookies eksternal: {exc}")
+
+    if not await ensure_timeline_ready(page, target_url, net_cfg, stats):
+        console.log("[ERROR] Page stuck, retrying … (timeline belum siap)")
         return False
-    console.log(f"[session] {len(valid)} cookies eksternal diterapkan dari {expanded}.")
     return True
 
 
@@ -681,43 +767,33 @@ async def run() -> None:
     activity: List[str] = []
 
     session_cfg = cfg["session"].copy()
-    session_cfg["chrome_profile_dir"] = session_cfg.get("chrome_profile_dir") or os.getenv("CHROME_PROFILE_DIR", "")
-    session_cfg["cookies_path"] = session_cfg.get("cookies_path") or os.getenv("TWITTER_COOKIES_PATH", "")
-    session_path = session_cfg.get("chrome_profile_dir") or session_cfg.get("user_data_dir") or SESSION_DIR
-    session_path = os.path.expanduser(session_path)
-    if session_cfg.get("chrome_profile_dir") and not os.path.exists(session_path):
-        console.print(
-            f"[bold red]Profil Chrome tidak ditemukan:[/] {session_path}\nSetel `session.chrome_profile_dir` ke path profil yang benar atau kosongkan untuk memakai direktori lokal."
-        )
-        return
+    session_cfg["profile_path"] = session_cfg.get("profile_path") or os.getenv("CHROME_PROFILE_PATH", "")
+    session_cfg["chrome_executable"] = session_cfg.get("chrome_executable") or os.getenv("CHROME_EXECUTABLE_PATH") or os.getenv("CHROME_PATH") or ""
 
+    profile_path = load_chrome_profile(session_cfg)
     pw = await async_playwright().start()
     launch_kwargs: Dict[str, Any] = {
-        "user_data_dir": session_path,
+        "user_data_dir": profile_path,
         "headless": False,
         "args": ["--start-maximized"],
     }
-    channel = session_cfg.get("browser_channel") or None
-    if channel:
-        launch_kwargs["channel"] = channel
-    console.log(f"[session] Memakai profil browser: {session_path} (channel={channel or 'default'})")
+
+    channel = session_cfg.get("browser_channel") or "chrome"
+    if channel != "chrome":
+        console.log("[WARN] Memaksa channel browser ke 'chrome' sesuai konfigurasi baru.")
+        channel = "chrome"
+    launch_kwargs["channel"] = channel
+
+    chrome_exec = resolve_chrome_executable(session_cfg)
+    if chrome_exec:
+        launch_kwargs["executable_path"] = chrome_exec
+        launch_kwargs.pop("channel", None)
+
     browser = await pw.chromium.launch_persistent_context(**launch_kwargs)
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
-    await apply_session_cookies(browser, session_cfg.get("cookies_path", ""))
-
-    await resilient_goto(page, SEARCH_URL, net_cfg, stats)
-    logged, reason = await _has_login_indicator(page)
-    if not logged:
-        console.print(
-            "[bold red]Sesi/cookies X tidak valid. Perbarui profil Chrome atau export cookies terbaru lalu jalankan ulang bot.[/]"
-        )
-        console.log(f"[session] Login indicator missing: {reason}")
-        await browser.close()
-        await pw.stop()
-        return
-    if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
-        console.print("[bold red]Halaman pencarian tidak siap setelah beberapa percobaan.[/]")
+    if not await ensure_session_valid(page, SEARCH_URL, net_cfg, stats, session_cfg):
+        console.print("[bold red]Gagal memastikan sesi X siap. Tutup aplikasi dan coba lagi setelah login manual.[/]")
         await browser.close()
         await pw.stop()
         return
@@ -732,12 +808,12 @@ async def run() -> None:
     with Live(console=console, refresh_per_second=4, screen=True) as live:
         while not state["quit"]:
             start = time.perf_counter()
-            logged_in, login_reason = await _has_login_indicator(page)
+            logged_in, login_reason = await is_logged_in(page)
             if not logged_in:
                 console.print(
-                    "[bold red]Sesi X tidak lagi valid di tengah jalan. Segarkan cookies/profil dan jalankan ulang bot.[/]"
+                    "[bold red]Sesi X tidak lagi valid di tengah jalan. Segarkan profil Chrome dan jalankan ulang bot.[/]"
                 )
-                console.log(f"[session] Login indicator hilang: {login_reason}")
+                console.log(f"[WARN] Login indicator missing di tengah siklus: {login_reason}")
                 break
             if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
                 await asyncio.sleep(1)
