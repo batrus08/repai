@@ -1,59 +1,82 @@
 # Repai
 
-Bot sederhana untuk memindai pencarian di X (Twitter) dan membalas secara otomatis.
-`twt.py` menjalankan browser Playwright, menerapkan filter kata kunci, serta
-opsional memanfaatkan OpenAI API untuk memilah tweet yang layak
-dibalas.
+Repai adalah bot otomatis untuk memindai pencarian di X (Twitter) dan
+merespons tweet secara selektif. Proyek ini memanfaatkan Playwright untuk
+mengendalikan browser Chromium, sedangkan OpenAI API digunakan secara opsional
+untuk memilah tweet yang layak dibalas berdasarkan niat (jual, beli, promosi).
 
-## Fitur
+> **Catatan:** Bot ini tidak dimaksudkan untuk spam massal. Pastikan Anda
+> mematuhi kebijakan platform X dan regulasi lokal terkait otomatisasi.
 
-- Memindai tweet terbaru sesuai kata kunci pencarian.
-- Prefilter kata positif/negatif yang didefinisikan pada `bot_config.json`.
-- Dukungan klasifikasi niat jual/beli melalui OpenAI (model dari variabel lingkungan `OPENAI_MODEL`, default `gpt-5-nano`; hanya diperlukan jika `ai_enabled=true`).
-- Menampilkan statistik proses dan penggunaan sistem.
-- Log aktivitas menampilkan tweet yang dibalas atau dilewati beserta alasannya.
-- Menyimpan ID tweet yang sudah dibalas ke `replied_ids.json` sehingga tidak diulang ketika bot dijalankan kembali.
-- Melewati otomatis tweet yang tidak dapat dibalas (misalnya karena balasan ditutup).
-- Penanganan CAPTCHA secara manual.
+---
 
-## Panduan Instalasi Lengkap di Ubuntu
+## Gambaran Umum Arsitektur
 
-Langkah-langkah berikut diuji pada Ubuntu 22.04 LTS, tetapi tetap relevan untuk
-versi 20.04/24.04 dengan penyesuaian minor. Seluruh perintah dijalankan dengan
-hak `sudo` kecuali disebutkan berbeda.
+| Komponen            | Deskripsi                                                                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `twt.py`            | Skrip utama yang memuat konfigurasi, menjalankan Playwright, menerapkan filter kata kunci, menangani CAPTCHA manual, dan mengirim balasan otomatis. |
+| `ai.py`             | Utilitas untuk berinteraksi dengan OpenAI API. Dipanggil hanya jika fitur klasifikasi AI diaktifkan.                                                |
+| `bot_config.json`   | Sumber konfigurasi utama (kata kunci pencarian, filter positif/negatif, opsi AI, pengaturan jeda, dsb).                                              |
+| `replied_ids.json`* | Cache ID tweet yang sudah dibalas supaya tidak diproses ulang. Dibuat otomatis ketika bot dijalankan.                                              |
+| `.env`*             | Berisi rahasia (OPENAI_API_KEY, OPENAI_MODEL, dsb). Tidak wajib jika memakai variabel lingkungan langsung.                                          |
 
-1. **Perbarui indeks paket dan paket yang sudah terpasang**
+`*` = Berkas ini dibuat oleh pengguna ketika dibutuhkan.
+
+---
+
+## Fitur Utama
+
+- **Pencarian Real-time** — Memindai tweet terbaru berdasarkan kata kunci.
+- **Filter Kata** — Prefilter positif dan negatif dari `bot_config.json`.
+- **Klasifikasi AI (opsional)** — Menggunakan OpenAI API untuk menyaring niat.
+- **Statistik Proses** — Menampilkan durasi siklus, jumlah tweet dibalas/lewat.
+- **Pencatatan Detail** — Log alasan tweet dilewati (sudah dibalas, ditandai
+  negatif, balasan tertutup, gagal memuat, dsb).
+- **Penyimpanan Status** — ID tweet yang sudah diproses disimpan ke
+  `replied_ids.json` agar eksekusi berikutnya lebih efisien.
+- **Penanganan CAPTCHA** — Jika X menampilkan CAPTCHA, bot berhenti sementara
+  dan meminta intervensi pengguna melalui antarmuka Playwright.
+
+---
+
+## Persyaratan Sistem
+
+- Ubuntu 22.04 LTS (berhasil diuji); versi 20.04/24.04 juga didukung dengan
+  penyesuaian kecil.
+- Python 3.9 atau lebih baru.
+- Akses internet stabil (dibutuhkan untuk API dan memuat halaman X).
+- Akun X (Twitter) dengan hak membalas tweet publik.
+
+---
+
+## Instalasi Lengkap di Ubuntu
+
+Gunakan hak `sudo` untuk seluruh perintah kecuali disebutkan berbeda.
+
+1. **Perbarui paket dasar**
 
    ```bash
    sudo apt update
    sudo apt upgrade -y
    ```
 
-   Disarankan memulai dengan sistem yang bersih agar dependensi Playwright tidak
-   berbenturan dengan paket lama.
-
-2. **Pasang dependensi sistem dasar**
+2. **Pasang dependensi sistem**
 
    ```bash
    sudo apt install -y git python3 python3-venv python3-pip \
-     build-essential libnss3 libatk-bridge2.0-0 libgtk-3-0 \
-     libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
-     libasound2 libxshmfence1 libpangocairo-1.0-0 libpango-1.0-0 \
-     fonts-liberation ca-certificates
+       build-essential libnss3 libatk-bridge2.0-0 libgtk-3-0 \
+       libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
+       libasound2 libxshmfence1 libpangocairo-1.0-0 libpango-1.0-0 \
+       fonts-liberation ca-certificates
    ```
 
-   Paket grafis diperlukan agar Chromium yang dibundel Playwright dapat
-   berjalan di lingkungan desktop maupun headless.
-
-3. **(Opsional) Buat akun layanan khusus**
+3. **(Opsional) Buat akun layanan**
 
    ```bash
    sudo useradd -m -s /bin/bash repai
    sudo passwd repai
    sudo usermod -aG sudo repai
    ```
-
-   Jalankan sisa langkah menggunakan akun ini demi keamanan operasional.
 
 4. **Klon repositori dan siapkan struktur kerja**
 
@@ -63,10 +86,7 @@ hak `sudo` kecuali disebutkan berbeda.
    mkdir -p logs data
    ```
 
-   Folder `logs/` atau `data/` dapat digunakan untuk menyimpan keluaran tambahan
-   (log khusus, cache, dsb.) bila diperlukan.
-
-5. **Buat dan aktifkan lingkungan virtual Python**
+5. **Buat lingkungan virtual Python**
 
    ```bash
    python3 -m venv .venv
@@ -74,50 +94,46 @@ hak `sudo` kecuali disebutkan berbeda.
    python -m pip install --upgrade pip
    ```
 
-   Mengisolasi dependensi mencegah konflik dengan paket Python lain di sistem.
-
-6. **Pasang dependensi Python proyek**
+6. **Pasang dependensi Python**
 
    ```bash
    pip install openai playwright psutil pyfiglet rich
    ```
 
-   Jika menggunakan file `requirements.txt` sendiri, ganti perintah di atas
-   dengan `pip install -r requirements.txt`.
+   Jika Anda memiliki `requirements.txt`, jalankan `pip install -r requirements.txt`.
 
-7. **Instal browser Playwright beserta dependensi tambahan**
+7. **Instal browser Playwright**
 
    ```bash
    playwright install --with-deps chromium
    ```
 
-   Opsi `--with-deps` memastikan paket sistem yang dibutuhkan Chromium ikut
-   terpasang. Jalankan perintah ini di dalam virtual environment.
+   Jalankan perintah ini di dalam virtual environment agar Playwright mengenali
+   path Python yang tepat.
 
-8. **Konfigurasikan berkas aplikasi**
+8. **Konfigurasikan aplikasi**
 
-   - Salin atau sunting `bot_config.json` sesuai kata kunci dan preferensi.
-   - Jika ingin menyimpan rahasia di `.env`, buat berkas dengan isi minimal:
+   - Salin contoh `bot_config.json` dan sesuaikan kata kunci, filter kata, serta
+     opsi `ai_enabled`.
+   - Buat `.env` (opsional) untuk menyimpan rahasia:
 
      ```ini
      OPENAI_API_KEY=sk-...
      OPENAI_MODEL=gpt-5-nano
      ```
 
-   - Pastikan file `.env` memiliki hak akses terbatas (`chmod 600 .env`).
+   - Atur izin rahasia: `chmod 600 .env`.
 
 9. **Verifikasi instalasi**
 
    ```bash
    python -m playwright --version
-   python -c "import psutil, rich; print('Playwright siap!')"
+   python -c "import playwright, psutil; print('Instalasi sukses!')"
    ```
 
-   Kedua perintah di atas memastikan modul inti dapat diimpor tanpa galat.
+10. **(Opsional) Layanan systemd**
 
-10. **(Opsional) Siapkan layanan systemd untuk menjalankan bot otomatis**
-
-    Buat file `/etc/systemd/system/repai.service` dengan isi berikut:
+    Buat `/etc/systemd/system/repai.service`:
 
     ```ini
     [Unit]
@@ -136,50 +152,100 @@ hak `sudo` kecuali disebutkan berbeda.
     WantedBy=multi-user.target
     ```
 
-    Kemudian aktifkan:
+    Aktifkan:
 
     ```bash
     sudo systemctl daemon-reload
     sudo systemctl enable --now repai.service
+    journalctl -u repai.service -f
     ```
 
-    Periksa log layanan dengan `journalctl -u repai.service -f`.
+---
 
-## Persiapan
+## Konfigurasi Bot
 
-1. **Dependensi Python**
+Contoh entri penting pada `bot_config.json`:
 
-   Instal paket yang diperlukan:
+```json
+{
+  "search_query": "(jual OR beli) laptop -giveaway",
+  "positive_keywords": ["beli", "butuh", "mencari"],
+  "negative_keywords": ["giveaway", "hadiah", "bot"],
+  "ai_enabled": true,
+  "reply_template": "Halo! Kami bisa bantu kebutuhan laptop Anda.",
+  "cooldown_seconds": 30
+}
+```
 
-   ```bash
-   pip install openai playwright psutil pyfiglet rich
-   ```
+Penjelasan singkat:
 
-   Jalankan juga `playwright install` untuk menyiapkan browser Chromium.
+- `search_query` — Query pencarian X standar dengan operator AND/OR/NOT.
+- `positive_keywords` — Kata yang wajib ada agar tweet dianggap relevan.
+- `negative_keywords` — Kata yang memicu penolakan otomatis.
+- `ai_enabled` — Mengaktifkan modul `ai.py`. Pastikan OPENAI_API_KEY tersedia.
+- `reply_template` — Pesan dasar yang akan dikirim. Anda bisa memformat ulang di
+  kode untuk personalisasi lebih lanjut.
+- `cooldown_seconds` — Interval minimal antar balasan agar tidak dianggap spam.
 
-2. **Konfigurasi**
-
-   Sunting `bot_config.json` sesuai kebutuhan. Jika `ai_enabled=true`,
-   bot akan meminta `OPENAI_API_KEY` saat pertama kali dijalankan bila
-   belum tersedia dan menyimpannya ke file `.env`. Nama model dapat
-   diatur melalui `OPENAI_MODEL` atau gunakan bawaan `gpt-5-nano`.
+---
 
 ## Menjalankan Bot
 
 ```bash
-# menjalankan bot; bila kunci belum ada, program akan memintanya
+# menjalankan bot; jika kunci belum tersedia, program akan memintanya
 python twt.py
 
-# atau langsung lewat variabel lingkungan
+# atau langsung melalui variabel lingkungan
 OPENAI_API_KEY=sk-xxx python twt.py
 ```
 
-Bot akan membuka jendela browser dan mulai memindai tweet. Hentikan dengan
-`Ctrl+C`.
+Saat dijalankan, bot akan:
 
-689ae136d81c8197914e45ac7a081d3106430c81bc47e9d2
+1. Membuka Chromium melalui Playwright.
+2. Meminta Anda login ke akun X (sekali saja per sesi).
+3. Memulai pencarian dan memproses timeline sesuai filter.
+4. Menampilkan log pada terminal serta menyimpan ringkasan di `logs/` (jika
+   Anda menambahkan handler logging).
+
+Hentikan dengan `Ctrl+C`. Playwright akan menutup browser secara otomatis.
+
+---
+
+## Automasi & Pengawasan
+
+- **Systemd**: Lihat bagian instalasi untuk template layanan.
+- **Supervisord / Docker**: Proyek dapat dibungkus container; pastikan volume
+  untuk `.env`, `bot_config.json`, dan `replied_ids.json` dipetakan.
+- **Monitoring**: Gunakan `journalctl`, `tail -f logs/bot.log`, atau integrasi
+  dengan alat observabilitas lain (Grafana, Prometheus) melalui eksport metric
+  di `twt.py` bila Anda menambahkannya.
+
+---
+
+## Troubleshooting
+
+| Masalah                                     | Penyebab Umum                                         | Solusi                                                                 |
+| ------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------------------------- |
+| Playwright gagal start Chromium             | Dependensi sistem kurang                             | Jalankan `playwright install --with-deps chromium` dan pastikan paket GTK terpasang. |
+| Bot macet karena CAPTCHA                    | X mendeteksi aktivitas otomatis                      | Selesaikan CAPTCHA secara manual, kemudian lanjutkan eksekusi.         |
+| Galat `OPENAI_API_KEY not set`             | Variabel lingkungan belum tersedia                   | Ekspor `OPENAI_API_KEY` atau buat `.env` sesuai panduan.               |
+| Tweet di-skip terus                         | Filter terlalu ketat atau cooldown terlalu tinggi    | Tinjau `bot_config.json`, kurangi kata negatif atau percepat `cooldown`.
+| `replied_ids.json` tumbuh besar             | Bot berjalan lama tanpa pembersihan                  | Arsipkan atau hapus entri lama secara berkala (tetap backup terlebih dahulu).
+
+---
+
+## Praktik Keamanan
+
+- Jangan commit `.env` atau `replied_ids.json` ke repositori publik.
+- Batasi hak akses file rahasia (`chmod 600 .env`).
+- Pertimbangkan menggunakan VPN atau IP statis agar sesi X tidak sering
+  memicu pemeriksaan keamanan.
+- Terapkan jeda balasan realistis (`cooldown_seconds`) untuk mengurangi risiko
+  diblokir oleh platform.
+
+---
 
 ## Lisensi
 
-Proyek ini dirilis tanpa lisensi khusus. Gunakan dengan risiko sendiri.
-
+Proyek ini dirilis tanpa lisensi khusus. Gunakan dengan risiko sendiri dan
+pertimbangkan implikasi hukum di yurisdiksi Anda.
