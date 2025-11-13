@@ -117,5 +117,11 @@
     "compact": true,
     "show_url": true,
     "interactive_keys": true
+  },
+  "session": {
+    "chrome_profile_dir": "",
+    "browser_channel": "chrome",
+    "user_data_dir": "bot_session",
+    "cookies_path": ""
   }
 }
