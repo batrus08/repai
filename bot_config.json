@@ -119,9 +119,10 @@
     "interactive_keys": true
   },
   "session": {
-    "chrome_profile_dir": "",
+    "profile_path": "",
+    "chrome_executable": "",
     "browser_channel": "chrome",
-    "user_data_dir": "bot_session",
-    "cookies_path": ""
+    "login_timeout_sec": 180,
+    "login_check_interval_sec": 2
   }
 }

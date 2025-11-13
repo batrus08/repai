@@ -173,7 +173,14 @@ Contoh entri penting pada `bot_config.json`:
   "negative_keywords": ["giveaway", "hadiah", "bot"],
   "ai_enabled": true,
   "reply_template": "Halo! Kami bisa bantu kebutuhan laptop Anda.",
-  "cooldown_seconds": 30
+  "cooldown_seconds": 30,
+  "session": {
+    "profile_path": "C:/Users/me/ChromeProfileForBot",
+    "chrome_executable": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "browser_channel": "chrome",
+    "login_timeout_sec": 240,
+    "login_check_interval_sec": 2
+  }
 }
 ```
 
@@ -186,6 +193,26 @@ Penjelasan singkat:
 - `reply_template` — Pesan dasar yang akan dikirim. Anda bisa memformat ulang di
   kode untuk personalisasi lebih lanjut.
 - `cooldown_seconds` — Interval minimal antar balasan agar tidak dianggap spam.
+- Bagian `session` — Pengaturan Chrome persisten (lihat penjelasan di bawah).
+
+### Pengaturan Chrome & Login Persisten
+
+- **Profil Chrome khusus** — Setel `session.profile_path` (atau variabel
+  lingkungan `CHROME_PROFILE_PATH`) ke folder user-data Chrome yang ingin
+  dipakai bot. Folder akan dibuat otomatis jika belum ada dan dipakai kembali di
+  eksekusi berikutnya.
+- **Path Chrome manual** — Jika ingin memaksa executable tertentu, isi
+  `session.chrome_executable` atau variabel `CHROME_EXECUTABLE_PATH`. Jika
+  dikosongkan, bot memakai Playwright channel `chrome` bawaan.
+- **Alur login** — Saat profil tidak memiliki sesi X yang valid, bot membuka
+  `https://x.com/login`, menampilkan log `[INFO] Session invalid → opening X login
+  page`, dan menunggu Anda login manual sekali. Setelah sukses, data tersimpan di
+  profil tersebut dan log `[INFO] Session valid → skipping login` akan muncul di
+  run berikutnya.
+- **Validasi otomatis** — Setiap awal siklus, bot mengecek indikator navbar X
+  menggunakan fungsi `is_logged_in()`. Jika indikator hilang, log
+  `[WARN] Login indicator missing …` muncul dan bot berhenti agar Anda bisa
+  memperbarui sesi.
 
 ---
 
