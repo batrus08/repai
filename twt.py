@@ -56,7 +56,6 @@ LOGIN_URL_HINTS = ("/login", "/i/flow/login")
 CONFIG_PATH = "bot_config.json"
 REPLIED_LOG = "replied_ids.json"
 SESSION_DIR = "bot_session"
-COOKIE_FILE = "session.json"
 
 DEFAULT_SCAN = {
     "scan_interval_ms": 1500,
@@ -83,6 +82,13 @@ DEFAULT_DASHBOARD = {
     "compact": True,
     "show_url": True,
     "interactive_keys": True,
+}
+
+DEFAULT_SESSION = {
+    "user_data_dir": SESSION_DIR,
+    "chrome_profile_dir": "",
+    "browser_channel": "chrome",
+    "cookies_path": "",
 }
 
 # Default search URL akan dibangun ulang dari config
@@ -159,6 +165,7 @@ def load_config() -> Dict[str, Any]:
     cfg["network"] = {**DEFAULT_NETWORK, **cfg.get("network", {})}
     cfg["reply"] = {**DEFAULT_REPLY, **cfg.get("reply", {})}
     cfg["dashboard"] = {**DEFAULT_DASHBOARD, **cfg.get("dashboard", {})}
+    cfg["session"] = {**DEFAULT_SESSION, **cfg.get("session", {})}
     return cfg
 
 
@@ -288,52 +295,34 @@ async def _has_login_indicator(page) -> tuple[bool, str]:
     return False, "selectors_missing"
 
 
-async def wait_until_logged_in(page, max_ms: int) -> bool:
-    """Menunggu hingga indikator login muncul dan menyimpan sesi."""
-    console.log(f"[login] Menunggu indikator login hingga {max_ms/1000:.1f}s…")
-    start = time.perf_counter()
-    reason = "selectors_missing"
-    while True:
-        ok, reason = await _has_login_indicator(page)
-        if ok:
-            console.log(f"[login] Indikator login ditemukan: {reason}.")
-            try:
-                await page.context.storage_state(path=COOKIE_FILE)
-                console.log("[login] Storage state diperbarui.")
-            except Exception as exc:
-                console.log(f"[login] Gagal menyimpan storage state: {exc}")
-            return True
-        if (time.perf_counter() - start) * 1000 >= max_ms:
-            console.log(f"[login] Indikator login tidak ditemukan ({reason}).")
-            return False
-        await asyncio.sleep(0.5)
-
-
-async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
-    """Pastikan sesi login aktif dan halaman hasil pencarian siap."""
-    ok, reason = await _has_login_indicator(page)
-    if ok:
-        return True
-
-    console.log(f"[login] Indikator login belum tersedia ({reason}).")
-
-    if not await _on_login_page(page):
-        console.log("[login] Halaman saat ini bukan /login. Memuat ulang halaman pencarian…")
-        await resilient_goto(page, search_url, net_cfg, stats)
-        ok, _ = await _has_login_indicator(page)
-        if ok:
-            console.log("[login] Indikator muncul setelah reload search.")
-            return True
-
-    console.log("[login] Mengarahkan ulang ke halaman login untuk validasi sesi…")
-    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
-    if await wait_until_logged_in(page, 120000):
-        console.log("[login] Login terverifikasi, kembali ke halaman pencarian.")
-        await resilient_goto(page, search_url, net_cfg, stats)
-        return True
-
-    console.log("[login] Tidak berhasil memverifikasi login setelah redirect.")
-    return False
+async def apply_session_cookies(context, cookies_path: str) -> bool:
+    """Tambahkan cookies eksternal (hasil export Chrome) ke konteks browser."""
+    if not cookies_path:
+        return False
+    expanded = os.path.expanduser(cookies_path)
+    if not os.path.exists(expanded):
+        console.log(f"[session] File cookies tidak ditemukan: {expanded}")
+        return False
+    data = load_json(expanded)
+    cookies: List[Dict[str, Any]] = []
+    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+        cookies = data["cookies"]
+    elif isinstance(data, list):
+        cookies = data
+    else:
+        console.log(f"[session] Format cookies tidak dikenali: {expanded}")
+        return False
+    valid = [c for c in cookies if isinstance(c, dict) and c.get("name") and c.get("value")]
+    if not valid:
+        console.log(f"[session] Tidak ada cookie valid di {expanded}")
+        return False
+    try:
+        await context.add_cookies(valid)
+    except Exception as exc:
+        console.log(f"[session] Gagal menerapkan cookies eksternal: {exc}")
+        return False
+    console.log(f"[session] {len(valid)} cookies eksternal diterapkan dari {expanded}.")
+    return True
 
 
 async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
@@ -691,25 +680,42 @@ async def run() -> None:
     last_activity: Optional[tuple[str, datetime]] = None
     activity: List[str] = []
 
+    session_cfg = cfg["session"].copy()
+    session_cfg["chrome_profile_dir"] = session_cfg.get("chrome_profile_dir") or os.getenv("CHROME_PROFILE_DIR", "")
+    session_cfg["cookies_path"] = session_cfg.get("cookies_path") or os.getenv("TWITTER_COOKIES_PATH", "")
+    session_path = session_cfg.get("chrome_profile_dir") or session_cfg.get("user_data_dir") or SESSION_DIR
+    session_path = os.path.expanduser(session_path)
+    if session_cfg.get("chrome_profile_dir") and not os.path.exists(session_path):
+        console.print(
+            f"[bold red]Profil Chrome tidak ditemukan:[/] {session_path}\nSetel `session.chrome_profile_dir` ke path profil yang benar atau kosongkan untuk memakai direktori lokal."
+        )
+        return
+
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch_persistent_context(
-        user_data_dir=SESSION_DIR, headless=False, args=["--start-maximized"]
-    )
+    launch_kwargs: Dict[str, Any] = {
+        "user_data_dir": session_path,
+        "headless": False,
+        "args": ["--start-maximized"],
+    }
+    channel = session_cfg.get("browser_channel") or None
+    if channel:
+        launch_kwargs["channel"] = channel
+    console.log(f"[session] Memakai profil browser: {session_path} (channel={channel or 'default'})")
+    browser = await pw.chromium.launch_persistent_context(**launch_kwargs)
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
-    # buka halaman login dan tunggu sampai benar-benar masuk
-    console.log("[login] Membuka halaman login untuk validasi sesi awal…")
-    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
-    login_spinner = Spinner("dots", text="Menunggu login…")
-    with Live(login_spinner, console=console, refresh_per_second=10):
-        logged = await wait_until_logged_in(page, 120000)
+    await apply_session_cookies(browser, session_cfg.get("cookies_path", ""))
+
+    await resilient_goto(page, SEARCH_URL, net_cfg, stats)
+    logged, reason = await _has_login_indicator(page)
     if not logged:
-        console.print("[bold red]Gagal login.[/]")
+        console.print(
+            "[bold red]Sesi/cookies X tidak valid. Perbarui profil Chrome atau export cookies terbaru lalu jalankan ulang bot.[/]"
+        )
+        console.log(f"[session] Login indicator missing: {reason}")
         await browser.close()
         await pw.stop()
         return
-
-    await resilient_goto(page, SEARCH_URL, net_cfg, stats)
     if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
         console.print("[bold red]Halaman pencarian tidak siap setelah beberapa percobaan.[/]")
         await browser.close()
@@ -726,10 +732,13 @@ async def run() -> None:
     with Live(console=console, refresh_per_second=4, screen=True) as live:
         while not state["quit"]:
             start = time.perf_counter()
-            logged_in = await ensure_logged_in(page, SEARCH_URL, net_cfg, stats)
+            logged_in, login_reason = await _has_login_indicator(page)
             if not logged_in:
-                await asyncio.sleep(1)
-                continue
+                console.print(
+                    "[bold red]Sesi X tidak lagi valid di tengah jalan. Segarkan cookies/profil dan jalankan ulang bot.[/]"
+                )
+                console.log(f"[session] Login indicator hilang: {login_reason}")
+                break
             if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
                 await asyncio.sleep(1)
                 continue
