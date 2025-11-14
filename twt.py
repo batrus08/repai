@@ -400,23 +400,49 @@ class ReplyResult:
 # ----------------- Login & navigasi -----------------
 
 
-async def wait_until_logged_in(page, max_ms: int) -> bool:
-    """Menunggu hingga ikon profil muncul yang menandakan login sukses."""
+LOGIN_INDICATORS = [
+    "[data-testid='AppTabBar_Profile_Link']",
+    "[data-testid='SideNav_AccountSwitcher_Button']",
+    "[data-testid='AccountSwitcher_Button']",
+]
+
+
+async def is_logged_in(page) -> bool:
+    """Cek apakah sesi sudah login berdasarkan cookie atau elemen navigasi."""
     try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=max_ms)
-        await page.context.storage_state(path=COOKIE_FILE)
-        return True
-    except TimeoutError:
-        return False
+        cookies = await page.context.cookies()
+        for cookie in cookies:
+            if cookie.get("name") == "auth_token" and cookie.get("value"):
+                return True
+    except Exception as exc:
+        log_event("login_cookie_check_failed", level=logging.DEBUG, error=str(exc))
+
+    for selector in LOGIN_INDICATORS:
+        try:
+            if await page.query_selector(selector):
+                return True
+        except TimeoutError:
+            continue
+        except Exception as exc:
+            log_event("login_indicator_check_failed", level=logging.DEBUG, selector=selector, error=str(exc))
+    return False
+
+
+async def wait_until_logged_in(page, max_ms: int) -> bool:
+    """Menunggu hingga indikator login muncul yang menandakan sesi aktif."""
+    deadline = time.perf_counter() + max_ms / 1000
+    while time.perf_counter() < deadline:
+        if await is_logged_in(page):
+            await page.context.storage_state(path=COOKIE_FILE)
+            return True
+        await asyncio.sleep(0.5)
+    return False
 
 
 async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
     """Pastikan sesi login aktif dan halaman hasil pencarian siap."""
-    try:
-        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=3000)
+    if await is_logged_in(page):
         return True
-    except TimeoutError:
-        pass
 
     await resilient_goto(page, LOGIN_URL, net_cfg, stats)
     if await wait_until_logged_in(page, 120000):
