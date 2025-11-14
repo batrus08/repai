@@ -259,8 +259,23 @@ def _json_default(obj: Any) -> str:
     return str(obj)
 
 
-def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+def _coerce_log_level(level: Any) -> int:
+    """Normalize log level input menjadi integer valid untuk logging."""
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        level = level.strip()
+        if level.isdigit():
+            return int(level)
+        candidate = getattr(logging, level.upper(), None)
+        if isinstance(candidate, int):
+            return candidate
+    return logging.INFO
+
+
+def log_event(event: str, *, level: int | str = logging.INFO, **fields: Any) -> None:
     """Catat event ke log biasa dan jurnal JSONL terpisah."""
+    level = _coerce_log_level(level)
     timestamp = datetime.utcnow().isoformat() + "Z"
     payload = {"ts": timestamp, "event": event, **fields}
     try:
