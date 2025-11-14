@@ -23,7 +23,6 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from urllib.parse import quote
@@ -42,43 +41,13 @@ from ai import classify_text
 
 console = Console()
 
-try:
-    from dotenv import load_dotenv as _load_dotenv
-except Exception:  # pragma: no cover - dependency optional at runtime
-    _load_dotenv = None
-
-LOGIN_SUCCESS_SELECTORS = [
-    "[data-testid='AppTabBar_Profile_Link']",
-    "[data-testid='AppTabBar_Home_Link']",
-    "[data-testid='AppTabBar_Notifications_Link']",
-    "[data-testid='AppTabBar_DirectMessage_Link']",
-    "[data-testid='SideNav_AccountSwitcher_Button']",
-]
-
-# Selector tambahan & heuristik yang relatif stabil pada UI baru Twitter/X.
-LOGIN_FALLBACK_INDICATORS = [
-    "[data-testid='AppTabBar_Explore_Link']",
-    "[data-testid='AppTabBar_Lists_Link']",
-    "[data-testid='DMDrawer']",
-    "nav[role='navigation'] a[href='/home']",
-    "a[href='/compose/post']",
-    "a[href='/settings/profile']",
-    "a[href='/i/settings/profile']",
-    "[data-testid='SideNav_NewTweet_Button']",
-]
-
-LOGIN_URL_HINTS = ("/login", "/i/flow/login")
-
-
-class LoginState(str, Enum):
-    LOGGED_IN = "LOGGED_IN"
-    ON_LOGIN_PAGE = "ON_LOGIN_PAGE"
-    UNKNOWN_OR_ERROR = "UNKNOWN_OR_ERROR"
-
 # ---------------- Konfigurasi & util dasar -----------------
 
 CONFIG_PATH = "bot_config.json"
 REPLIED_LOG = "replied_ids.json"
+SESSION_DIR = "bot_session"
+COOKIE_FILE = "session.json"
+
 DEFAULT_SCAN = {
     "scan_interval_ms": 1500,
     "no_new_cycles_before_refresh": 6,
@@ -89,8 +58,6 @@ DEFAULT_NETWORK = {
     "timeout_ms": 15000,
     "max_retries": 3,
     "retry_backoff_ms": 1200,
-    "health_max_retries": 3,
-    "stuck_wait_ms": 2000,
 }
 
 DEFAULT_REPLY = {
@@ -106,11 +73,6 @@ DEFAULT_DASHBOARD = {
     "interactive_keys": True,
 }
 
-DEFAULT_SESSION = {
-    "login_timeout_sec": 180,
-    "login_check_interval_sec": 2,
-}
-
 # Default search URL akan dibangun ulang dari config
 SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
 
@@ -120,108 +82,8 @@ AI_CACHE: Dict[str, Tuple[str, int]] = {}
 ENV_FILE = ".env"
 
 
-@dataclass
-class BrowserEnvConfig:
-    user_data_dir: str
-    profile_name: str
-    executable_path: Optional[str]
-    cookies_path: Optional[str]
-    using_external_profile: bool
-
-
-def _expand(path: str) -> str:
-    return os.path.abspath(os.path.expanduser(path))
-
-
-def build_browser_env_config() -> BrowserEnvConfig:
-    user_data_root = os.getenv("CHROME_USER_DATA_DIR", "").strip()
-    profile_name = os.getenv("CHROME_PROFILE_NAME", "").strip() or "Default"
-    cookies_path = os.getenv("TWITTER_COOKIES_PATH", "").strip()
-    executable_override = os.getenv("CHROME_EXECUTABLE_PATH", "").strip() or os.getenv("CHROME_PATH", "").strip()
-
-    using_external_profile = bool(user_data_root)
-    if user_data_root:
-        resolved_root = _expand(user_data_root)
-        if not os.path.exists(resolved_root):
-            console.log(
-                f"[WARN] Provided CHROME_USER_DATA_DIR does not exist at {resolved_root}. Creating directory for you."
-            )
-            os.makedirs(resolved_root, exist_ok=True)
-        else:
-            console.log(f"[INFO] Using existing Chrome user data dir: {resolved_root}")
-            console.log("[WARN] Close regular Chrome before running the bot to avoid profile lock or crashes.")
-    else:
-        resolved_root = _expand(os.path.join(os.getcwd(), "bot_session"))
-        os.makedirs(resolved_root, exist_ok=True)
-        console.log(f"[INFO] Using dedicated bot Chrome profile at: {resolved_root}")
-
-    console.log(f"[INFO] Using Chrome profile directory: {profile_name}")
-
-    executable_path: Optional[str] = None
-    if executable_override:
-        expanded_exec = _expand(executable_override)
-        if os.path.exists(expanded_exec):
-            executable_path = expanded_exec
-            console.log(f"[INFO] Chrome executable: {expanded_exec}")
-        else:
-            console.log(
-                f"[WARN] Chrome executable path '{expanded_exec}' not found. Falling back to Playwright chrome channel."
-            )
-    else:
-        console.log("[WARN] Chrome executable path not set; using Playwright chrome channel.")
-
-    cookies_abs = _expand(cookies_path) if cookies_path else None
-
-    return BrowserEnvConfig(
-        user_data_dir=resolved_root,
-        profile_name=profile_name,
-        executable_path=executable_path,
-        cookies_path=cookies_abs,
-        using_external_profile=using_external_profile,
-    )
-
-
-async def maybe_apply_twitter_cookies(context, cookies_path: Optional[str]) -> None:
-    """Load cookies from TWITTER_COOKIES_PATH if provided."""
-    if not cookies_path:
-        return
-    if not os.path.exists(cookies_path):
-        console.log(f"[WARN] TWITTER_COOKIES_PATH not found at {cookies_path}. Skipping cookie import.")
-        return
-
-    try:
-        with open(cookies_path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except json.JSONDecodeError as exc:
-        console.log(f"[WARN] Failed to parse cookies JSON at {cookies_path}: {exc}")
-        return
-    except OSError as exc:
-        console.log(f"[WARN] Failed to read cookies file at {cookies_path}: {exc}")
-        return
-
-    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
-        cookies = data["cookies"]
-    elif isinstance(data, list):
-        cookies = data
-    else:
-        console.log(f"[WARN] Cookies file at {cookies_path} must be a list or {{'cookies': []}} structure.")
-        return
-
-    valid_cookies = [c for c in cookies if isinstance(c, dict) and c.get("name") and c.get("value")]
-    if not valid_cookies:
-        console.log(f"[WARN] No valid cookies found inside {cookies_path}. Skipping import.")
-        return
-
-    await context.add_cookies(valid_cookies)
-    console.log(f"[INFO] Loaded {len(valid_cookies)} cookies into the browser context from {cookies_path}.")
-
-
 def load_env() -> None:
-    """Load key-value pairs from `.env` using python-dotenv if available."""
-    if _load_dotenv is not None:
-        _load_dotenv(ENV_FILE, override=False)
-        return
-
+    """Load key-value pairs from ENV_FILE into environment variables."""
     if not os.path.exists(ENV_FILE):
         return
     try:
@@ -285,7 +147,6 @@ def load_config() -> Dict[str, Any]:
     cfg["network"] = {**DEFAULT_NETWORK, **cfg.get("network", {})}
     cfg["reply"] = {**DEFAULT_REPLY, **cfg.get("reply", {})}
     cfg["dashboard"] = {**DEFAULT_DASHBOARD, **cfg.get("dashboard", {})}
-    cfg["session"] = {**DEFAULT_SESSION, **cfg.get("session", {})}
     return cfg
 
 
@@ -386,154 +247,29 @@ class ReplyResult:
 # ----------------- Login & navigasi -----------------
 
 
-async def _get_pathname(page) -> str:
+async def wait_until_logged_in(page, max_ms: int) -> bool:
+    """Menunggu hingga ikon profil muncul yang menandakan login sukses."""
     try:
-        return await page.evaluate("() => window.location ? window.location.pathname : ''")
-    except Exception:
-        return ""
-
-
-async def _on_login_page(page) -> bool:
-    url = page.url or ""
-    if any(hint in url for hint in LOGIN_URL_HINTS):
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=max_ms)
+        await page.context.storage_state(path=COOKIE_FILE)
         return True
-    path = await _get_pathname(page)
-    return bool(path and any(path.startswith(hint) for hint in LOGIN_URL_HINTS))
+    except TimeoutError:
+        return False
 
 
-async def _has_login_indicator(page) -> tuple[bool, str]:
-    """Return (True, reason) jika indikator login ditemukan."""
-    selectors = LOGIN_SUCCESS_SELECTORS + LOGIN_FALLBACK_INDICATORS
-    for selector in selectors:
-        try:
-            handle = await page.query_selector(selector)
-        except Exception:
-            handle = None
-        if handle:
-            return True, selector
-
-    # UI X cukup fluktuatif; cek localStorage "active_user_id" sebagai indikator tambahan.
+async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
+    """Pastikan sesi login aktif dan halaman hasil pencarian siap."""
     try:
-        has_active_user = await page.evaluate(
-            "() => { try { return Boolean(window?.localStorage?.getItem('active_user_id')); } catch (e) { return false; } }"
-        )
-    except Exception:
-        has_active_user = False
-    if has_active_user:
-        return True, "localStorage_active_user"
+        await page.wait_for_selector("[data-testid='AppTabBar_Profile_Link']", timeout=3000)
+        return True
+    except TimeoutError:
+        pass
 
-    return False, "selectors_missing"
-
-
-async def determine_login_state(page) -> tuple[LoginState, str]:
-    """Kembalikan status login yang lebih eksplisit."""
-    if await _on_login_page(page):
-        return LoginState.ON_LOGIN_PAGE, "login_page"
-
-    logged, reason = await _has_login_indicator(page)
-    if logged:
-        return LoginState.LOGGED_IN, reason
-
-    url = page.url or ""
-    if any(hint in url for hint in LOGIN_URL_HINTS):
-        return LoginState.ON_LOGIN_PAGE, "login_url"
-
-    return LoginState.UNKNOWN_OR_ERROR, reason
-
-
-async def wait_for_manual_login(page, timeout_sec: int, interval_sec: int) -> bool:
-    """Tunggu hingga user login manual di jendela browser."""
-    console.print(
-        "[bold yellow]X login required. Please complete the sign-in flow in the opened browser window.[/]"
-    )
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        state, _ = await determine_login_state(page)
-        if state is LoginState.LOGGED_IN:
-            return True
-        await asyncio.sleep(interval_sec)
+    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    if await wait_until_logged_in(page, 120000):
+        await resilient_goto(page, search_url, net_cfg, stats)
+        return True
     return False
-
-
-async def is_logged_in(page) -> tuple[bool, str]:
-    """Periksa apakah pengguna sudah login berdasarkan indikator global."""
-    state, reason = await determine_login_state(page)
-    return state is LoginState.LOGGED_IN, reason
-
-
-LOGIN_PAGE_URL = "https://x.com/login"
-
-
-async def ensure_logged_in_state(
-    page,
-    net_cfg: Dict[str, int],
-    stats: Dict[str, int],
-    session_cfg: Dict[str, Any],
-    target_url: str,
-) -> bool:
-    """Pastikan user mendapatkan kesempatan login manual sebelum melanjutkan."""
-    timeout_sec = int(session_cfg.get("login_timeout_sec", 180))
-    interval_sec = int(session_cfg.get("login_check_interval_sec", 2))
-    max_unknown_attempts = max(2, net_cfg.get("health_max_retries", 1))
-    unknown_attempts = 0
-
-    while True:
-        state, reason = await determine_login_state(page)
-        if state is LoginState.LOGGED_IN:
-            console.log(f"[INFO] Detected valid X session. Continuing without login. (indicator: {reason})")
-            return True
-
-        if state is LoginState.ON_LOGIN_PAGE:
-            console.log("[INFO] X login required. Please login in the browser window.")
-            success = await wait_for_manual_login(page, timeout_sec, interval_sec)
-            if success:
-                console.log("[INFO] Login detected. Session will be reused next time.")
-                return True
-            console.log("[WARN] Login not detected before timeout. Reloading login page for another attempt.")
-            if not await resilient_goto(page, LOGIN_PAGE_URL, net_cfg, stats):
-                return False
-            continue
-
-        unknown_attempts += 1
-        if unknown_attempts > max_unknown_attempts:
-            console.log("[ERROR] Cannot determine X login state. Please check manually.")
-            return False
-
-        console.log(
-            f"[WARN] Cannot determine X login state (reason: {reason}). Reloading page ({unknown_attempts}/{max_unknown_attempts})."
-        )
-        if not await resilient_goto(page, target_url, net_cfg, stats):
-            return False
-
-
-async def ensure_session_valid(
-    page,
-    target_url: str,
-    net_cfg: Dict[str, int],
-    stats: Dict[str, int],
-    session_cfg: Dict[str, Any],
-) -> bool:
-    """Validasi sesi dan pastikan halaman target siap dipindai."""
-    if not await resilient_goto(page, target_url, net_cfg, stats):
-        console.log("[ERROR] Page stuck, retrying … (navigasi awal ke target)")
-        return False
-
-    if not await ensure_logged_in_state(page, net_cfg, stats, session_cfg, target_url):
-        return False
-
-    if not await resilient_goto(page, target_url, net_cfg, stats):
-        console.log("[ERROR] Page stuck, retrying … (navigasi ke target)")
-        return False
-
-    logged, reason = await is_logged_in(page)
-    if not logged:
-        console.log(f"[WARN] Login indicator missing setelah menuju target: {reason}")
-        return False
-
-    if not await ensure_timeline_ready(page, target_url, net_cfg, stats):
-        console.log("[ERROR] Page stuck, retrying … (timeline belum siap)")
-        return False
-    return True
 
 
 async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
@@ -543,88 +279,8 @@ async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[st
             await page.goto(url, timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
             await detect_captcha(page, stats)
             return True
-        except Exception as exc:
-            stats["goto_retry"] = stats.get("goto_retry", 0) + 1
-            console.log(f"[net] goto gagal (attempt {attempt + 1}/{net_cfg['max_retries']}): {exc}")
+        except Exception:
             await asyncio.sleep(net_cfg["retry_backoff_ms"] / 1000 * (attempt + 1))
-    return False
-
-
-async def _safe_query(page, selector: str) -> bool:
-    try:
-        return bool(await page.query_selector(selector))
-    except Exception:
-        return False
-
-
-async def _page_ready_state(page) -> str:
-    try:
-        return await page.evaluate("() => document.readyState || ''")
-    except Exception:
-        return ""
-
-
-async def _timeline_has_error(page) -> bool:
-    error_selectors = [
-        "text='Something went wrong'",
-        "text='Try again'",
-        "text='Reload'",
-        "[data-testid='error-detail']",
-    ]
-    for sel in error_selectors:
-        if await _safe_query(page, sel):
-            return True
-    return False
-
-
-async def timeline_looks_stuck(page) -> bool:
-    """Heuristik sederhana untuk mendeteksi timeline yang macet/half-loaded."""
-    ready_state = await _page_ready_state(page)
-    spinner = await _safe_query(page, "div[role='progressbar']")
-    has_error = await _timeline_has_error(page)
-    has_article = await _safe_query(page, "article")
-    if has_error:
-        return True
-    if spinner and ready_state != "complete":
-        return True
-    if not has_article:
-        if ready_state != "complete":
-            return True
-        empty_ok = await _safe_query(page, "text='No results'") or await _safe_query(page, "text='No results for'")
-        return not empty_ok
-    return False
-
-
-async def recover_timeline(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int], reason: str) -> None:
-    stats["page_recoveries"] = stats.get("page_recoveries", 0) + 1
-    console.log(f"[health] Memicu pemulihan timeline ({reason}).")
-    try:
-        await page.reload(timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
-        return
-    except Exception as exc:
-        stats["reload_fail"] = stats.get("reload_fail", 0) + 1
-        console.log(f"[health] Reload gagal: {exc}. Memaksa goto ulang.")
-    await resilient_goto(page, search_url, net_cfg, stats)
-
-
-async def ensure_timeline_ready(page, search_url: str, net_cfg: Dict[str, int], stats: Dict[str, int]) -> bool:
-    """Pastikan artikel timeline termuat dan tidak macet sebelum memproses siklus."""
-    max_attempts = net_cfg.get("health_max_retries", 1)
-    for attempt in range(max_attempts):
-        try:
-            await page.wait_for_selector("article", timeout=net_cfg["timeout_ms"])
-        except TimeoutError:
-            stats["timeline_timeout"] = stats.get("timeline_timeout", 0) + 1
-            await recover_timeline(page, search_url, net_cfg, stats, reason="wait_timeout")
-            await asyncio.sleep(net_cfg["stuck_wait_ms"] / 1000)
-            continue
-
-        if not await timeline_looks_stuck(page):
-            return True
-
-        stats["timeline_stuck"] = stats.get("timeline_stuck", 0) + 1
-        await recover_timeline(page, search_url, net_cfg, stats, reason="half_loaded")
-        await asyncio.sleep(net_cfg["stuck_wait_ms"] / 1000)
     return False
 
 
@@ -891,32 +547,24 @@ async def run() -> None:
     last_activity: Optional[tuple[str, datetime]] = None
     activity: List[str] = []
 
-    session_cfg = cfg["session"].copy()
-    browser_env = build_browser_env_config()
     pw = await async_playwright().start()
-    launch_kwargs: Dict[str, Any] = {
-        "user_data_dir": browser_env.user_data_dir,
-        "headless": False,
-        "args": [
-            "--start-maximized",
-            f"--profile-directory={browser_env.profile_name}",
-        ],
-    }
-
-    if browser_env.executable_path:
-        launch_kwargs["executable_path"] = browser_env.executable_path
-    else:
-        launch_kwargs["channel"] = "chrome"
-
-    browser = await pw.chromium.launch_persistent_context(**launch_kwargs)
-    await maybe_apply_twitter_cookies(browser, browser_env.cookies_path)
+    browser = await pw.chromium.launch_persistent_context(
+        user_data_dir=SESSION_DIR, headless=False, args=["--start-maximized"]
+    )
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
-    if not await ensure_session_valid(page, SEARCH_URL, net_cfg, stats, session_cfg):
-        console.print("[bold red]Gagal memastikan sesi X siap. Tutup aplikasi dan coba lagi setelah login manual.[/]")
+    # buka halaman login dan tunggu sampai benar-benar masuk
+    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    login_spinner = Spinner("dots", text="Menunggu login…")
+    with Live(login_spinner, console=console, refresh_per_second=10):
+        logged = await wait_until_logged_in(page, 120000)
+    if not logged:
+        console.print("[bold red]Gagal login.[/]")
         await browser.close()
         await pw.stop()
         return
+
+    await resilient_goto(page, SEARCH_URL, net_cfg, stats)
     work_spinner = Spinner("line")
 
     if cfg["dashboard"].get("interactive_keys", True):
@@ -928,15 +576,14 @@ async def run() -> None:
     with Live(console=console, refresh_per_second=4, screen=True) as live:
         while not state["quit"]:
             start = time.perf_counter()
-            logged_in, login_reason = await is_logged_in(page)
+            logged_in = await ensure_logged_in(page, SEARCH_URL, net_cfg, stats)
             if not logged_in:
-                console.print(
-                    "[bold red]Sesi X tidak lagi valid di tengah jalan. Segarkan profil Chrome dan jalankan ulang bot.[/]"
-                )
-                console.log(f"[WARN] Login indicator missing di tengah siklus: {login_reason}")
-                break
-            if not await ensure_timeline_ready(page, SEARCH_URL, net_cfg, stats):
                 await asyncio.sleep(1)
+                continue
+            try:
+                await page.wait_for_selector("article", timeout=net_cfg["timeout_ms"])
+            except TimeoutError:
+                await resilient_goto(page, SEARCH_URL, net_cfg, stats)
                 continue
             refreshed = False
 
@@ -999,8 +646,7 @@ async def run() -> None:
             if not new_candidates:
                 no_new += 1
                 if state["force_refresh"] or no_new >= scan_cfg["no_new_cycles_before_refresh"]:
-                    reason = "force_refresh" if state["force_refresh"] else "stale_timeline"
-                    await recover_timeline(page, SEARCH_URL, net_cfg, stats, reason=reason)
+                    await page.reload()
                     refreshed = True
                     state["force_refresh"] = False
                     no_new = 0
