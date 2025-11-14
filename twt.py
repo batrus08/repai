@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 import unicodedata
+import threading
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -79,6 +81,8 @@ DEFAULT_LOGGING = {
     "file": "logs/bot.log",
     "max_bytes": 1_048_576,  # 1 MB
     "backup_count": 3,
+    "event_file": "logs/events.jsonl",
+    "error_file": "logs/error.log",
 }
 
 # Default search URL akan dibangun ulang dari config
@@ -87,26 +91,52 @@ SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_cli
 AI_CACHE_TTL_MS = 86_400_000  # 24 jam
 AI_CACHE: Dict[str, Tuple[str, int]] = {}
 
+EVENT_JOURNAL: "EventJournal" | None = None
+EARLY_EVENTS: List[Dict[str, Any]] = []
+
 ENV_FILE = ".env"
+
+
+class EventJournal:
+    """Sederhana: mencatat event ke file JSONL agar mudah ditelusuri."""
+
+    def __init__(self, path: str):
+        self.path = path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def append(self, payload: Dict[str, Any]) -> None:
+        line = json.dumps(payload, ensure_ascii=False, default=_json_default)
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.write("\n")
 
 
 def load_env() -> None:
     """Load key-value pairs from ENV_FILE into environment variables."""
     if not os.path.exists(ENV_FILE):
+        log_event("env_missing", level=logging.DEBUG, path=ENV_FILE)
         return
+    loaded = 0
     try:
         with open(ENV_FILE, encoding="utf-8") as f:
             for line in f:
                 if "=" in line:
                     key, val = line.strip().split("=", 1)
                     os.environ.setdefault(key, val)
-    except OSError:
-        pass
+                    loaded += 1
+        log_event("env_loaded", level=logging.DEBUG, path=ENV_FILE, entries=loaded)
+    except OSError as exc:
+        log_exception("env_load_failed", exc, path=ENV_FILE)
 
 
 def ensure_api_key() -> bool:
     """Pastikan OPENAI_API_KEY tersedia; jika tidak, minta user dan simpan."""
     if os.getenv("OPENAI_API_KEY"):
+        log_event("api_key_available", source="env")
         return True
     try:
         from getpass import getpass
@@ -116,6 +146,7 @@ def ensure_api_key() -> bool:
         key = input("Masukkan OPENAI_API_KEY: ").strip()
     if not key:
         console.print("[bold red]OPENAI_API_KEY diperlukan untuk AI.[/]")
+        log_event("api_key_missing_input", level=logging.WARNING)
         return False
     env_vars: Dict[str, str] = {}
     if os.path.exists(ENV_FILE):
@@ -130,6 +161,7 @@ def ensure_api_key() -> bool:
             f.write(f"{k}={v}\n")
     os.environ["OPENAI_API_KEY"] = key
     console.print("[green]OPENAI_API_KEY tersimpan ke .env[/]")
+    log_event("api_key_saved", path=ENV_FILE)
     return True
 
 
@@ -137,11 +169,15 @@ def ensure_api_key() -> bool:
 
 def load_json(path: str) -> Optional[Any]:
     if not os.path.exists(path):
+        log_event("json_missing", level=logging.DEBUG, path=path)
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
+            data = json.load(f)
+        log_event("json_loaded", level=logging.DEBUG, path=path)
+        return data
+    except json.JSONDecodeError as exc:
+        log_exception("json_decode_error", exc, path=path)
         return None
 
 
@@ -156,6 +192,7 @@ def load_config() -> Dict[str, Any]:
     cfg["reply"] = {**DEFAULT_REPLY, **cfg.get("reply", {})}
     cfg["dashboard"] = {**DEFAULT_DASHBOARD, **cfg.get("dashboard", {})}
     cfg["logging"] = {**DEFAULT_LOGGING, **cfg.get("logging", {})}
+    log_event("config_loaded", search=cfg.get("search_config", {}))
     return cfg
 
 
@@ -164,6 +201,8 @@ def setup_logging(log_cfg: Dict[str, Any]) -> None:
     level_name = str(log_cfg.get("level", "INFO")).upper()
     level = getattr(logging, level_name, logging.INFO)
     log_file = log_cfg.get("file", DEFAULT_LOGGING["file"])
+    event_file = log_cfg.get("event_file", DEFAULT_LOGGING["event_file"])
+    error_file = log_cfg.get("error_file", DEFAULT_LOGGING["error_file"])
     max_bytes = int(log_cfg.get("max_bytes", DEFAULT_LOGGING["max_bytes"]))
     backup_count = int(log_cfg.get("backup_count", DEFAULT_LOGGING["backup_count"]))
 
@@ -177,19 +216,38 @@ def setup_logging(log_cfg: Dict[str, Any]) -> None:
         backupCount=backup_count,
         encoding="utf-8",
     )
+    error_handler = RotatingFileHandler(
+        error_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
     stream_handler = logging.StreamHandler()
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    for handler in (file_handler, stream_handler):
+    for handler in (file_handler, stream_handler, error_handler):
         handler.setFormatter(fmt)
-        handler.setLevel(level)
+        handler.setLevel(level if handler is not error_handler else logging.WARNING)
 
-    logging.basicConfig(level=level, handlers=[file_handler, stream_handler], force=True)
+    logging.basicConfig(level=level, handlers=[file_handler, stream_handler, error_handler], force=True)
+    global EVENT_JOURNAL
+    EVENT_JOURNAL = EventJournal(event_file)
+    if EARLY_EVENTS:
+        for entry in EARLY_EVENTS:
+            EVENT_JOURNAL.append(entry)
+        EARLY_EVENTS.clear()
     logging.getLogger("playwright").setLevel(logging.WARNING)
     logging.info(
         "Log sistem aktif di %s (level=%s)", os.path.abspath(log_file), logging.getLevelName(level)
+    )
+    log_event(
+        "logging_initialized",
+        log_file=os.path.abspath(log_file),
+        error_file=os.path.abspath(error_file),
+        event_file=os.path.abspath(event_file),
+        level=logging.getLevelName(level),
     )
 
 
@@ -202,13 +260,24 @@ def _json_default(obj: Any) -> str:
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
-    """Catat event sebagai JSON ke sistem log utama."""
-    payload = {"event": event, **fields}
+    """Catat event ke log biasa dan jurnal JSONL terpisah."""
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    payload = {"ts": timestamp, "event": event, **fields}
     try:
         logging.log(level, json.dumps(payload, ensure_ascii=False, default=_json_default))
     except TypeError:
         safe_payload = {k: str(v) for k, v in payload.items()}
         logging.log(level, json.dumps(safe_payload, ensure_ascii=False))
+    entry = {"severity": logging.getLevelName(level), **payload}
+    if EVENT_JOURNAL:
+        EVENT_JOURNAL.append(entry)
+    else:
+        EARLY_EVENTS.append(entry)
+
+
+def log_exception(event: str, exc: BaseException, **fields: Any) -> None:
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    log_event(event, level=logging.ERROR, error=str(exc), traceback=tb, **fields)
 
 
 def build_search_url(cfg: Dict[str, Any]) -> str:
@@ -227,7 +296,9 @@ def build_search_url(cfg: Dict[str, Any]) -> str:
 
 def load_replied() -> List[int]:
     data = load_json(REPLIED_LOG)
-    return data if isinstance(data, list) else []
+    replied = data if isinstance(data, list) else []
+    log_event("replied_loaded", count=len(replied))
+    return replied
 
 
 def save_replied(ids: List[int]) -> None:
@@ -237,6 +308,7 @@ def save_replied(ids: List[int]) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, REPLIED_LOG)
+    log_event("replied_saved", count=len(ids))
 
 
 def normalize_text(text: str) -> str:
@@ -257,6 +329,7 @@ def passes_prefilter(text: str, pos_keywords: List[str], neg_keywords: List[str]
 async def wait_for_manual_captcha() -> None:
     console.print("[bold yellow]⚠️ CAPTCHA terdeteksi. Selesaikan di browser dan tekan Enter…[/]")
     await asyncio.to_thread(input)
+    log_event("captcha_resolved")
 
 
 async def detect_captcha(page, stats: Optional[Dict[str, int]] = None) -> None:
@@ -340,8 +413,10 @@ async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[st
     """Pergi ke URL dengan retry dan backoff."""
     for attempt in range(net_cfg["max_retries"]):
         try:
+            log_event("goto_attempt", level=logging.DEBUG, url=url, attempt=attempt + 1)
             await page.goto(url, timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
             await detect_captcha(page, stats)
+            log_event("goto_success", level=logging.DEBUG, url=url, attempt=attempt + 1)
             return True
         except Exception as exc:
             logging.warning(
@@ -351,8 +426,10 @@ async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[st
                 net_cfg["max_retries"],
                 exc,
             )
+            log_event("goto_retry", level=logging.WARNING, url=url, attempt=attempt + 1, error=str(exc))
             await asyncio.sleep(net_cfg["retry_backoff_ms"] / 1000 * (attempt + 1))
     logging.error("Gagal membuka %s setelah %d percobaan", url, net_cfg["max_retries"])
+    log_event("goto_failed", url=url, attempts=net_cfg["max_retries"])
     return False
 
 
@@ -368,6 +445,7 @@ async def soft_scan_cycle(
 ) -> List[Candidate]:
     """Scan DOM untuk tweet baru tanpa reload."""
     candidates: List[Candidate] = []
+    log_event("scan_cycle_start", level=logging.DEBUG)
     arts = await page.query_selector_all("article")
     stats["found"] = stats.get("found", 0) + len(arts)
     stats["found_last"] = len(arts)
@@ -404,6 +482,13 @@ async def soft_scan_cycle(
 
     # scroll ringan untuk memunculkan item baru
     await page.mouse.wheel(0, 1000)
+    log_event(
+        "scan_cycle_end",
+        level=logging.DEBUG,
+        total=len(arts),
+        fresh=len(candidates),
+        ignored_old=stats.get("age", 0),
+    )
     return candidates
 
 
@@ -433,6 +518,13 @@ async def attempt_reply(
         stats["skip_tombol"] = stats.get("skip_tombol", 0) + 1
         return ReplyResult("skip", "skip_tombol")
 
+    log_event(
+        "reply_attempt",
+        level=logging.DEBUG,
+        tweet_id=cand.tid,
+        author=cand.author,
+        dry_run=state.get("dry_run", False),
+    )
     t0 = time.perf_counter()
     try:
         await btn.click(timeout=reply_cfg["click_timeout_ms"])
@@ -442,19 +534,27 @@ async def attempt_reply(
         await page.fill("div[role='textbox']", reply_msg)
         if state["dry_run"]:
             await page.keyboard.press("Escape")
-            return ReplyResult("skip", "dry_run", {
-                "candidate_to_click": int((t1 - t0) * 1000),
-                "click_to_textbox": int((t2 - t1) * 1000),
-            })
+            result = ReplyResult(
+                "skip",
+                "dry_run",
+                {
+                    "candidate_to_click": int((t1 - t0) * 1000),
+                    "click_to_textbox": int((t2 - t1) * 1000),
+                },
+            )
+            log_event("reply_dry_run", tweet_id=cand.tid, author=cand.author, durations=result.durations)
+            return result
         send_btn = await page.query_selector("[data-testid='tweetButton']")
         if not send_btn or await send_btn.get_attribute("aria-disabled") == "true":
             stats["skip_closed"] = stats.get("skip_closed", 0) + 1
             await page.keyboard.press("Escape")
+            log_event("reply_closed", tweet_id=cand.tid, author=cand.author)
             return ReplyResult("skip", "reply_closed")
         await send_btn.click(timeout=reply_cfg["submit_timeout_ms"])
         t3 = time.perf_counter()
     except TimeoutError:
         stats["net_error"] = stats.get("net_error", 0) + 1
+        log_event("reply_timeout", level=logging.WARNING, tweet_id=cand.tid, author=cand.author)
         return ReplyResult("skip", "net_error")
 
     durations = {
@@ -469,6 +569,7 @@ async def attempt_reply(
         if "reply" in msg and ("can't" in msg or "cannot" in msg or "tidak" in msg):
             stats["skip_closed"] = stats.get("skip_closed", 0) + 1
             await page.keyboard.press("Escape")
+            log_event("reply_closed_toast", tweet_id=cand.tid, author=cand.author, message=msg)
             return ReplyResult("skip", "reply_closed", durations)
     except TimeoutError:
         pass
@@ -481,6 +582,7 @@ async def attempt_reply(
     replied.add(cand.tid)
     save_replied(list(replied))
     stats["replied"] = stats.get("replied", 0) + 1
+    log_event("reply_sent", tweet_id=cand.tid, author=cand.author, durations=durations)
     return ReplyResult("reply", "balas_ok", durations)
 
 
@@ -510,6 +612,7 @@ def record_decision(
             f.write("\n")
     except Exception as exc:
         logging.warning("Gagal menulis log keputusan: %s", exc)
+        log_event("decision_log_failed", level=logging.WARNING, error=str(exc))
     log_event("decision", **data)
 
 
@@ -538,6 +641,7 @@ def record_cycle(
             f.write("\n")
     except Exception as exc:
         logging.warning("Gagal menulis log siklus: %s", exc)
+        log_event("cycle_log_failed", level=logging.WARNING, error=str(exc))
     log_event("cycle", **data)
 
 
@@ -601,18 +705,23 @@ async def key_listener(state: Dict[str, Any]) -> None:
         ch = ch.strip().lower()
         if ch == "p":
             state["paused"] = not state["paused"]
+            log_event("key_toggle_pause", paused=state["paused"])
         elif ch == "r":
             state["force_refresh"] = True
+            log_event("key_force_refresh")
         elif ch == "d":
             state["dry_run"] = not state["dry_run"]
+            log_event("key_toggle_dry_run", dry_run=state["dry_run"])
         elif ch == "q":
             state["quit"] = True
+            log_event("key_quit")
 
 
 # ----------------------------- Main loop -----------------------------
 
 
 async def run() -> None:
+    log_event("bot_start")
     load_env()
     cfg = load_config()
     setup_logging(cfg["logging"])
@@ -626,6 +735,7 @@ async def run() -> None:
     ai_timeout = cfg.get("ai_timeout_ms", 4000)
     pre_filter = cfg.get("pre_filter_keywords", True)
     if ai_enabled and not ensure_api_key():
+        log_event("bot_stop_missing_api_key")
         return
 
     scan_cfg = cfg["scan"]
@@ -653,9 +763,11 @@ async def run() -> None:
         logged = await wait_until_logged_in(page, 120000)
     if not logged:
         console.print("[bold red]Gagal login.[/]")
+        log_event("login_failed")
         await browser.close()
         await pw.stop()
         return
+    log_event("login_success")
 
     await resilient_goto(page, SEARCH_URL, net_cfg, stats)
     work_spinner = Spinner("line")
@@ -671,6 +783,7 @@ async def run() -> None:
             start = time.perf_counter()
             logged_in = await ensure_logged_in(page, SEARCH_URL, net_cfg, stats)
             if not logged_in:
+                log_event("ensure_login_failed", level=logging.WARNING)
                 await asyncio.sleep(1)
                 continue
             try:
@@ -757,8 +870,9 @@ async def run() -> None:
                         if res.action == "reply":
                             last_activity = (cand.author, datetime.now())
                     new_candidates = cands
-                except Exception:
+                except Exception as exc:
                     logging.exception("Kesalahan saat memproses kandidat; lanjut ke siklus berikutnya")
+                    log_exception("candidate_loop_failed", exc)
 
             dur = int((time.perf_counter() - start) * 1000)
             timers["scan_cycle"].append(dur)
@@ -799,6 +913,7 @@ async def run() -> None:
 
     await browser.close()
     await pw.stop()
+    log_event("bot_stop")
 
 
 if __name__ == "__main__":
@@ -806,7 +921,9 @@ if __name__ == "__main__":
         asyncio.run(run())
     except KeyboardInterrupt:
         console.print("[red]🛑 Bot dihentikan oleh user.[/]")
+        log_event("bot_stop_keyboard")
     except Exception as e:
+        log_exception("startup_error", e)
         console.print(f"[bold red]Error startup:[/] {e}")
         sys.exit(1)
 
