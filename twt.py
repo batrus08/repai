@@ -87,6 +87,7 @@ DEFAULT_LOGGING = {
 
 # Default search URL akan dibangun ulang dari config
 SEARCH_URL = "https://x.com/search?q=chatgpt%20%23zonauang&src=recent_search_click&f=live"
+LOGIN_URL = "https://x.com/i/flow/login"
 
 AI_CACHE_TTL_MS = 86_400_000  # 24 jam
 AI_CACHE: Dict[str, Tuple[str, int]] = {}
@@ -417,7 +418,7 @@ async def ensure_logged_in(page, search_url: str, net_cfg: Dict[str, int], stats
     except TimeoutError:
         pass
 
-    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    await resilient_goto(page, LOGIN_URL, net_cfg, stats)
     if await wait_until_logged_in(page, 120000):
         await resilient_goto(page, search_url, net_cfg, stats)
         return True
@@ -772,7 +773,7 @@ async def run() -> None:
     page = browser.pages[0] if browser.pages else await browser.new_page()
 
     # buka halaman login dan tunggu sampai benar-benar masuk
-    await resilient_goto(page, "https://x.com/login", net_cfg, stats)
+    await resilient_goto(page, LOGIN_URL, net_cfg, stats)
     login_spinner = Spinner("dots", text="Menunggu login…")
     with Live(login_spinner, console=console, refresh_per_second=10):
         logged = await wait_until_logged_in(page, 120000)
