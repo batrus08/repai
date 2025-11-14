@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import tempfile
 import time
@@ -71,6 +72,13 @@ DEFAULT_DASHBOARD = {
     "compact": True,
     "show_url": True,
     "interactive_keys": True,
+}
+
+DEFAULT_LOGGING = {
+    "level": "INFO",
+    "file": "logs/bot.log",
+    "max_bytes": 1_048_576,  # 1 MB
+    "backup_count": 3,
 }
 
 # Default search URL akan dibangun ulang dari config
@@ -147,7 +155,42 @@ def load_config() -> Dict[str, Any]:
     cfg["network"] = {**DEFAULT_NETWORK, **cfg.get("network", {})}
     cfg["reply"] = {**DEFAULT_REPLY, **cfg.get("reply", {})}
     cfg["dashboard"] = {**DEFAULT_DASHBOARD, **cfg.get("dashboard", {})}
+    cfg["logging"] = {**DEFAULT_LOGGING, **cfg.get("logging", {})}
     return cfg
+
+
+def setup_logging(log_cfg: Dict[str, Any]) -> None:
+    """Siapkan sistem log ke file & konsol dengan rotasi otomatis."""
+    level_name = str(log_cfg.get("level", "INFO")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    log_file = log_cfg.get("file", DEFAULT_LOGGING["file"])
+    max_bytes = int(log_cfg.get("max_bytes", DEFAULT_LOGGING["max_bytes"]))
+    backup_count = int(log_cfg.get("backup_count", DEFAULT_LOGGING["backup_count"]))
+
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    stream_handler = logging.StreamHandler()
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(fmt)
+        handler.setLevel(level)
+
+    logging.basicConfig(level=level, handlers=[file_handler, stream_handler], force=True)
+    logging.getLogger("playwright").setLevel(logging.WARNING)
+    logging.info(
+        "Log sistem aktif di %s (level=%s)", os.path.abspath(log_file), logging.getLevelName(level)
+    )
 
 
 def build_search_url(cfg: Dict[str, Any]) -> str:
@@ -279,8 +322,16 @@ async def resilient_goto(page, url: str, net_cfg: Dict[str, int], stats: Dict[st
             await page.goto(url, timeout=net_cfg["timeout_ms"], wait_until="domcontentloaded")
             await detect_captcha(page, stats)
             return True
-        except Exception:
+        except Exception as exc:
+            logging.warning(
+                "Gagal membuka %s (percobaan %d/%d): %s",
+                url,
+                attempt + 1,
+                net_cfg["max_retries"],
+                exc,
+            )
             await asyncio.sleep(net_cfg["retry_backoff_ms"] / 1000 * (attempt + 1))
+    logging.error("Gagal membuka %s setelah %d percobaan", url, net_cfg["max_retries"])
     return False
 
 
@@ -426,8 +477,8 @@ def record_decision(cand: Candidate, res: ReplyResult, path: str = "decisions.lo
         with open(path, "a", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
             f.write("\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning("Gagal menulis log keputusan: %s", exc)
 
 
 def record_cycle(
@@ -445,8 +496,8 @@ def record_cycle(
         with open(path, "a", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
             f.write("\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning("Gagal menulis log siklus: %s", exc)
 
 
 # ---------------- Dashboard & input -----------------
@@ -523,6 +574,7 @@ async def key_listener(state: Dict[str, Any]) -> None:
 async def run() -> None:
     load_env()
     cfg = load_config()
+    setup_logging(cfg["logging"])
     global SEARCH_URL
     SEARCH_URL = build_search_url(cfg)
     pos_kws = [normalize_text(k) for k in cfg.get("positive_keywords", [])]
@@ -635,8 +687,7 @@ async def run() -> None:
                             last_activity = (cand.author, datetime.now())
                     new_candidates = cands
                 except Exception:
-                    # loop resilien: lanjut saja
-                    pass
+                    logging.exception("Kesalahan saat memproses kandidat; lanjut ke siklus berikutnya")
 
             dur = int((time.perf_counter() - start) * 1000)
             timers["scan_cycle"].append(dur)

@@ -15,6 +15,7 @@ dibalas.
 - Menyimpan ID tweet yang sudah dibalas ke `replied_ids.json` sehingga tidak diulang ketika bot dijalankan kembali.
 - Melewati otomatis tweet yang tidak dapat dibalas (misalnya karena balasan ditutup).
 - Penanganan CAPTCHA secara manual.
+- Sistem log terpusat ke file `logs/bot.log` lengkap dengan rotasi otomatis agar memudahkan investigasi masalah.
 
 ## Persiapan
 
@@ -34,6 +35,21 @@ dibalas.
    bot akan meminta `OPENAI_API_KEY` saat pertama kali dijalankan bila
    belum tersedia dan menyimpannya ke file `.env`. Nama model dapat
    diatur melalui `OPENAI_MODEL` atau gunakan bawaan `gpt-5-nano`.
+
+   Bagian `logging` mengendalikan perilaku log sistem:
+
+   ```json
+   "logging": {
+     "level": "INFO",
+     "file": "logs/bot.log",
+     "max_bytes": 1048576,
+     "backup_count": 3
+   }
+   ```
+
+   - `level`: `DEBUG`, `INFO`, `WARNING`, dll.
+   - `file`: lokasi file log. Folder akan dibuat otomatis.
+   - `max_bytes` dan `backup_count`: mengaktifkan rotasi sehingga log lama tersimpan.
 
 ## Menjalankan Bot
 
