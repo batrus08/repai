@@ -119,5 +119,11 @@
     "compact": true,
     "show_url": true,
     "interactive_keys": true
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/bot.log",
+    "max_bytes": 1048576,
+    "backup_count": 3
   }
 }
