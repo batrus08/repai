@@ -193,6 +193,24 @@ def setup_logging(log_cfg: Dict[str, Any]) -> None:
     )
 
 
+def _json_default(obj: Any) -> str:
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, timedelta):
+        return str(obj.total_seconds())
+    return str(obj)
+
+
+def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+    """Catat event sebagai JSON ke sistem log utama."""
+    payload = {"event": event, **fields}
+    try:
+        logging.log(level, json.dumps(payload, ensure_ascii=False, default=_json_default))
+    except TypeError:
+        safe_payload = {k: str(v) for k, v in payload.items()}
+        logging.log(level, json.dumps(safe_payload, ensure_ascii=False))
+
+
 def build_search_url(cfg: Dict[str, Any]) -> str:
     sc = cfg.get("search_config") or {}
     keyword = sc.get("keyword", "chatgpt")
@@ -246,12 +264,14 @@ async def detect_captcha(page, stats: Optional[Dict[str, int]] = None) -> None:
     if "captcha" in u or "challenge" in u:
         if stats is not None:
             stats["captcha"] = stats.get("captcha", 0) + 1
+        log_event("captcha_detected", url=page.url)
         await wait_for_manual_captcha()
         return
     try:
         if await page.query_selector("iframe[src*='captcha']"):
             if stats is not None:
                 stats["captcha"] = stats.get("captcha", 0) + 1
+            log_event("captcha_detected", url=page.url)
             await wait_for_manual_captcha()
     except TimeoutError:
         pass
@@ -262,6 +282,7 @@ async def detect_rate_limit(page, stats: Optional[Dict[str, int]] = None) -> boo
         if await page.query_selector("text='Rate limit exceeded'"):
             if stats is not None:
                 stats["rate"] = stats.get("rate", 0) + 1
+            log_event("rate_limit", url=page.url)
             return True
     except TimeoutError:
         pass
@@ -463,28 +484,45 @@ async def attempt_reply(
     return ReplyResult("reply", "balas_ok", durations)
 
 
-def record_decision(cand: Candidate, res: ReplyResult, path: str = "decisions.log") -> None:
-    data = {
+def record_decision(
+    cand: Candidate,
+    res: ReplyResult,
+    path: str = "decisions.log",
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    text_excerpt = " ".join(cand.text.split())[:200]
+    data: Dict[str, Any] = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "tweet_id": cand.tid,
         "author": cand.author,
+        "tweet_url": f"https://x.com/{cand.author}/status/{cand.tid}",
         "age_min": int((datetime.now(timezone.utc) - cand.created_at).total_seconds() / 60),
         "action": res.action,
         "reason": res.reason,
         "dur_ms": res.durations,
+        "excerpt": text_excerpt,
     }
+    if extra:
+        data["meta"] = extra
     try:
         with open(path, "a", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
             f.write("\n")
     except Exception as exc:
         logging.warning("Gagal menulis log keputusan: %s", exc)
+    log_event("decision", **data)
 
 
 def record_cycle(
-    cycle: int, found: int, new_candidates: int, dur_ms: int, refreshed: bool, path: str = "cycles.log"
+    cycle: int,
+    found: int,
+    new_candidates: int,
+    dur_ms: int,
+    refreshed: bool,
+    path: str = "cycles.log",
+    stats_snapshot: Optional[Dict[str, int]] = None,
 ) -> None:
-    data = {
+    data: Dict[str, Any] = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "cycle": cycle,
         "found": found,
@@ -492,12 +530,15 @@ def record_cycle(
         "scan_cycle_ms": dur_ms,
         "refreshed": refreshed,
     }
+    if stats_snapshot:
+        data["stats"] = stats_snapshot
     try:
         with open(path, "a", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
             f.write("\n")
     except Exception as exc:
         logging.warning("Gagal menulis log siklus: %s", exc)
+    log_event("cycle", **data)
 
 
 # ---------------- Dashboard & input -----------------
@@ -648,7 +689,11 @@ async def run() -> None:
                         norm_text = normalize_text(cand.text)
                         if pre_filter and not passes_prefilter(norm_text, pos_kws, neg_kws):
                             stats["skip_kata"] = stats.get("skip_kata", 0) + 1
-                            record_decision(cand, ReplyResult("skip", "prefilter"))
+                            record_decision(
+                                cand,
+                                ReplyResult("skip", "prefilter"),
+                                extra={"prefilter": True},
+                            )
                             activity.append(f"@{cand.author} skip: kata")
                             if len(activity) > 10:
                                 activity.pop(0)
@@ -660,19 +705,45 @@ async def run() -> None:
                             cached = AI_CACHE.get(cache_key)
                             if cached and now_ms - cached[1] < AI_CACHE_TTL_MS:
                                 label = cached[0]
+                                log_event(
+                                    "ai_cache_hit",
+                                    level=logging.DEBUG,
+                                    tweet_id=cand.tid,
+                                    author=cand.author,
+                                    label=label,
+                                )
                             else:
+                                ai_start = time.perf_counter()
                                 res = await classify_text(cand.text, timeout_ms=ai_timeout)
+                                elapsed_ms = int((time.perf_counter() - ai_start) * 1000)
                                 if res is None:
                                     stats["ai_disabled"] = stats.get("ai_disabled", 0) + 1
                                     logging.warning(
                                         "AI classification unavailable; proceeding without filter"
                                     )
+                                    log_event(
+                                        "ai_unavailable",
+                                        tweet_id=cand.tid,
+                                        author=cand.author,
+                                        latency_ms=elapsed_ms,
+                                    )
                                 else:
                                     label = res
                                     AI_CACHE[cache_key] = (label, now_ms)
+                                    log_event(
+                                        "ai_classify",
+                                        tweet_id=cand.tid,
+                                        author=cand.author,
+                                        label=label,
+                                        latency_ms=elapsed_ms,
+                                    )
                             if label != "pembeli":
                                 stats["ai_amb"] = stats.get("ai_amb", 0) + 1
-                                record_decision(cand, ReplyResult("skip", "ai_amb"))
+                                record_decision(
+                                    cand,
+                                    ReplyResult("skip", "ai_amb"),
+                                    extra={"ai_label": label},
+                                )
                                 activity.append(f"@{cand.author} skip: ai_amb")
                                 if len(activity) > 10:
                                     activity.pop(0)
@@ -715,7 +786,14 @@ async def run() -> None:
             live.update(render_dashboard(stats, timers, status, activity))
 
             cycle += 1
-            record_cycle(cycle, stats.get("found_last", 0), len(new_candidates), dur, refreshed)
+            record_cycle(
+                cycle,
+                stats.get("found_last", 0),
+                len(new_candidates),
+                dur,
+                refreshed,
+                stats_snapshot=dict(stats),
+            )
 
             await asyncio.sleep(scan_cfg["scan_interval_ms"] / 1000)
 
