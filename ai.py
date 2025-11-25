@@ -65,4 +65,4 @@ async def classify_text(text: str, *, timeout_ms: int = 4000) -> Optional[str]:
         "Kamu mengklasifikasikan teks menjadi 'penjual', 'pembeli', atau 'lainnya'. "
         "Jawab hanya salah satu kata itu."
     )
-    return await ask_ai(system_msg, text, max_tokens=1, timeout=timeout_ms / 1000)
+    return await ask_ai(system_msg, text, max_tokens=16, timeout=timeout_ms / 1000)

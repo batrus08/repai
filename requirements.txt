@@ -1,0 +1,8 @@
+openai
+playwright
+psutil
+pyfiglet
+rich
+pytest
+pytest-asyncio
+pytest-mock
